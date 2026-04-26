@@ -1,12 +1,23 @@
 """
 ═══════════════════════════════════════════════════════════════════════════
-  FORENSIC IMAGE ANALYSIS ENGINE v3.0
+  FORENSIC IMAGE ANALYSIS ENGINE v3.1  (PATCHED)
   ────────────────────────────────────
   Architecture:  pytsk3 (SleuthKit) · python-evtx · python-registry
                  Isolation Forest (Behavioral) · FAISS · Gemini RAG
   ────────────────────────────────────
   Input:   Raw disk image (.dd / .E01)
   Output:  LLM-explained forensic evidence with anomaly classification
+
+  PATCH NOTES v3.1:
+    FIX-1  get_user_roots()             — deduplicate; verify entries are dirs
+    FIX-2  heuristic_discover_files()   — dotted-dir support; safe meta check
+    FIX-3  extract_browser_history()    — Firefox hashed-profile descent
+    FIX-4  extract_recent_documents()   — dir-type guard; loop no longer aborts
+    FIX-5  extract_all_ntuser()         — dir-type guard + cross-root dedup
+    FIX-6  extract_communication_artifacts() — wider depth; all roots searched
+    FIX-7  extract_srum_data()          — isolated task; 7 case-variant probes
+    FIX-8  extract_execution_history()  — guard against None current_audit_df
+    FIX-9  carve_evidence_from_image()  — SRUM/EXECUTION tasks isolated
 ═══════════════════════════════════════════════════════════════════════════
 """
 
@@ -36,22 +47,21 @@ load_dotenv(os.path.join(SCRIPT_DIR, ".env"))
 # SECTION 1: GLOBAL STATE
 # ═══════════════════════════════════════════════════════════════════════════
 
-current_audit_df = None          # Unified evidence DataFrame
-faiss_index = None               # FAISS index cache (Memory optimized)
-ai_model = None                  # SentenceTransformer model (lazy loaded)
-image_hash_sha256 = None         # SHA-256 of uploaded forensic image
-artifact_counts = {}             # {"evtx": N, "registry": N, ...}
-ml_alarm = None                  # Isolation Forest v2 model
-cached_system_facts = None       # Cached string for LLM context (performance)
+current_audit_df = None
+faiss_index = None
+ai_model = None
+image_hash_sha256 = None
+artifact_counts = {}
+ml_alarm = None
+cached_system_facts = None
+debug_extract = True
 
-# -- PHASE 1 & 5: SESSION & REPORTING STATE --
 investigator_name = "Unknown Examiner"
 case_id = "CASE-2026-001"
 case_notes = ""
-session_log = []                 # List of {"query": q, "answer": a, "evidence_ids": [ids]}
-db_conn = None                   # In-memory SQLite for high-speed correlation
+session_log = []
+db_conn = None
 
-# Load the ML model (v2: 3-feature behavioral)
 MODEL_PATH = os.path.join(SCRIPT_DIR, "models", "forensic_alarm_v2.pkl")
 if not os.path.exists(MODEL_PATH):
     raise FileNotFoundError(
@@ -62,11 +72,9 @@ ml_alarm = joblib.load(MODEL_PATH)
 print(f"  [OK] Loaded ML model: {MODEL_PATH}")
 
 def init_correlation_db():
-    """Initialize an in-memory SQLite database for fast cross-artifact correlation."""
     global db_conn
     db_conn = sqlite3.connect(":memory:", check_same_thread=False)
     cursor = db_conn.cursor()
-    # Table for LNK and Jump List correlation
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS correlations (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -83,7 +91,6 @@ def init_correlation_db():
 
 init_correlation_db()
 
-# Heuristic threat Event IDs
 HEURISTIC_THREAT_IDS = {
     1102: "Audit Log Cleared",
     4720: "User Account Created",
@@ -94,19 +101,16 @@ HEURISTIC_THREAT_IDS = {
     8001: "Security Bypass (Defender/UAC Disabled)",
 }
 
-# Gemini LLM Setup (Modern SDK)
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 GEMINI_MODEL_ID = "gemini-2.0-flash"
 if not GEMINI_API_KEY:
     raise RuntimeError(
-        "[ERROR] GEMINI_API_KEY not set. Create a .env file with your key. "
-        "Get one at: https://aistudio.google.com/app/apikey"
+        "[ERROR] GEMINI_API_KEY not set. Create a .env file with your key."
     )
 from google import genai
 gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 print("  [OK] Gemini LLM configured (Modern SDK).")
 
-# Groq LLM Setup (Fallback)
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 groq_client = None
 if GROQ_API_KEY:
@@ -125,7 +129,6 @@ if GROQ_API_KEY:
 import time
 
 def compute_sha256(filepath):
-    """Compute SHA-256 hash of a file with retries for transient locks."""
     sha256 = hashlib.sha256()
     for attempt in range(5):
         try:
@@ -135,7 +138,7 @@ def compute_sha256(filepath):
             return sha256.hexdigest()
         except PermissionError:
             if attempt < 4:
-                time.sleep(1)  # Wait for AV scan to release lock
+                time.sleep(1)
             else:
                 return "HASH_FAILED_PERMISSION_DENIED"
         except Exception:
@@ -143,9 +146,7 @@ def compute_sha256(filepath):
 
 
 def parse_evtx_file(evtx_data):
-    """Parse a .evtx file from raw bytes into a DataFrame."""
     import Evtx.Evtx as evtx
-    import Evtx.Views as evtx_views
     import xml.etree.ElementTree as ET
 
     records = []
@@ -170,7 +171,6 @@ def parse_evtx_file(evtx_data):
                     time_created = time_el.get('SystemTime', 'N/A') if time_el is not None else 'N/A'
                     channel = channel_el.text if channel_el is not None else 'Unknown'
 
-                    # Try to extract task/description from EventData
                     event_data = root.find('ns:EventData', ns)
                     task_desc = ""
                     if event_data is not None:
@@ -203,7 +203,6 @@ def parse_evtx_file(evtx_data):
 
 
 def parse_registry_hive(reg_data, hive_name="SYSTEM"):
-    """Parse a registry hive file from raw bytes into a DataFrame."""
     from Registry import Registry as reg_lib
 
     records = []
@@ -211,7 +210,6 @@ def parse_registry_hive(reg_data, hive_name="SYSTEM"):
         tmp.write(reg_data)
         tmp_path = tmp.name
 
-    # High-interest registry paths for forensic analysis
     FORENSIC_KEYS = [
         "Microsoft\\Windows\\CurrentVersion\\Run",
         "Microsoft\\Windows\\CurrentVersion\\RunOnce",
@@ -233,24 +231,23 @@ def parse_registry_hive(reg_data, hive_name="SYSTEM"):
             timestamp = key.timestamp()
             ts_str = timestamp.strftime('%Y-%m-%d %H:%M:%S') if timestamp else 'N/A'
 
-            # Determine if this is a forensically interesting key
             is_interesting = any(fk.lower() in key_path.lower() for fk in FORENSIC_KEYS)
 
-            # Determine synthetic Event ID based on key type
             if "run" in key_path.lower() and ("currentversion\\run" in key_path.lower()):
-                event_id = 8000  # Persistence
+                event_id = 8000
             elif "defender" in key_path.lower() or "disableantispyware" in key_path.lower():
-                event_id = 8001  # Security bypass
+                event_id = 8001
             elif "usbstor" in key_path.lower() or "enum\\usb" in key_path.lower():
-                event_id = 9000  # USB history
+                event_id = 9000
             else:
-                event_id = 7000  # Normal registry state
+                event_id = 7000
 
             for value in key.values():
                 try:
                     val_name = value.name()
-                    val_data = str(value.value())[:200]  # Truncate long values
-                    task_desc = f"Registry {'' if is_interesting else ''}[{hive_name}] {key_path}\\{val_name} = {val_data}"
+                    val_data = str(value.value())
+                    display_data = val_data[:300] + ("..." if len(val_data) > 300 else "")
+                    task_desc = f"Registry [{hive_name}] {key_path}\\{val_name} = {display_data}"
 
                     records.append({
                         'Date and Time': ts_str,
@@ -259,6 +256,7 @@ def parse_registry_hive(reg_data, hive_name="SYSTEM"):
                         'LogSource': 'REGISTRY',
                         'Keywords': 'Alert' if is_interesting else 'None',
                         'ArtifactType': 'REGISTRY',
+                        '_full_val': val_data
                     })
                 except Exception:
                     continue
@@ -282,7 +280,6 @@ def parse_registry_hive(reg_data, hive_name="SYSTEM"):
     return pd.DataFrame(records)
 
 
-# ── PyEWF Wrapper for .E01 Support ──
 try:
     import pytsk3
     class EWFImgInfo(pytsk3.Img_Info):
@@ -303,82 +300,125 @@ except ImportError:
     pass
 
 
-def walk_filesystem(fs, max_entries=100000):
-    """Recursively walk the filesystem and catalog all files/directories."""
-    records = []
-    count = [0]
+# ═══════════════════════════════════════════════════════════════════════════
+# FIX-1: get_user_roots — deduplicated + directory-verified
+# ═══════════════════════════════════════════════════════════════════════════
 
-    def _walk(directory_path, depth=0, max_depth=10):
-        if count[0] >= max_entries or depth > max_depth:
+def get_user_roots(fs):
+    """
+    Return de-duplicated user-profile base paths that actually exist as
+    directories in the mounted filesystem.
+    """
+    seen_lower = set()
+    roots = []
+
+    candidates = [
+        "/Users", "/USERS",
+        "/Documents and Settings", "/DOCUMENTS AND SETTINGS",
+    ]
+    for c in candidates:
+        c_lower = c.lower()
+        if c_lower in seen_lower:
+            continue
+        try:
+            d = fs.open_dir(c)
+            if d is not None:
+                roots.append(c)
+                seen_lower.add(c_lower)
+        except Exception:
+            pass
+
+    # Case-insensitive sweep of root directory
+    try:
+        root_dir = fs.open_dir("/")
+        for entry in root_dir:
+            try:
+                ntype = entry.info.name.type
+                meta_type = entry.info.meta.type if entry.info.meta else None
+                is_dir = (ntype == 2) or (meta_type == 2)
+                if not is_dir:
+                    continue
+                name = entry.info.name.name.decode('utf-8', errors='ignore')
+                if name.lower() in ('users', 'documents and settings'):
+                    key = f"/{name}".lower()
+                    if key not in seen_lower:
+                        roots.append(f"/{name}")
+                        seen_lower.add(key)
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    return roots
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# FIX-2: heuristic_discover_files — dotted-dir support + safe meta check
+# ═══════════════════════════════════════════════════════════════════════════
+
+_SKIP_DIRS_LOWER = {
+    'winsxs', 'servicing', 'driverstore',
+    '$recycle.bin', 'recycled', 'recycler',
+    'windows.old',
+}
+
+
+def heuristic_discover_files(fs, target_patterns, start_path="/",
+                              max_depth=6, depth=0):
+    """
+    Recursively search for files/dirs matching target_patterns.
+    Dotted directory names (e.g. Firefox hashed profiles) are now traversed.
+    """
+    compiled = [re.compile(p, re.IGNORECASE) for p in target_patterns]
+    found = []
+    _skip_names = {'.', '..', '$orphanfiles'}
+
+    def _walk(path, d):
+        if d > max_depth:
             return
         try:
-            dir_obj = fs.open_dir(directory_path)
+            directory = fs.open_dir(path)
+            if directory is None:
+                return
         except Exception:
             return
-        for entry in dir_obj:
-            if count[0] >= max_entries:
-                return
+
+        for entry in directory:
             try:
-                name = entry.info.name.name.decode('utf-8', errors='ignore')
-                if name in ['.', '..', '$OrphanFiles']:
+                raw_name = entry.info.name.name
+                name = (raw_name.decode('utf-8', errors='ignore')
+                        if isinstance(raw_name, bytes) else raw_name)
+                if name.lower() in _skip_names:
                     continue
-                full_path = f"{directory_path}/{name}" if directory_path != "/" else f"/{name}"
-                meta = entry.info.meta
-                # 1 = TSK_FS_NAME_TYPE_REG (File), 2 = TSK_FS_NAME_TYPE_DIR (Dir)
-                ntype = entry.info.name.type
-                is_dir = (ntype == 2)
-                is_file = (ntype == 1)
-                
-                size = meta.size if meta and meta.size else 0
-                ext = os.path.splitext(name)[1].lower() if is_file and '.' in name else ''
 
-                # Extract timestamps
-                crtime = datetime.fromtimestamp(meta.crtime, timezone.utc).strftime('%Y-%m-%d %H:%M:%S') if meta and meta.crtime and meta.crtime > 0 else 'N/A'
-                mtime = datetime.fromtimestamp(meta.mtime, timezone.utc).strftime('%Y-%m-%d %H:%M:%S') if meta and meta.mtime and meta.mtime > 0 else 'N/A'
+                full_path = f"{path}/{name}" if path != "/" else f"/{name}"
 
-                if is_file or is_dir:
-                    ftype = "Directory" if is_dir else "File"
-                    size_str = f"{size:,} bytes" if size < 1024*1024 else f"{size/(1024*1024):.1f} MB"
-                    task_desc = f"{ftype}: {full_path} (Size: {size_str}, Modified: {mtime})"
+                if any(p.search(name) for p in compiled):
+                    found.append(full_path)
 
-                    records.append({
-                        'Date and Time': mtime,
-                        'Event ID': '0',
-                        'Task Category': task_desc,
-                        'LogSource': 'FILESYSTEM',
-                        'Keywords': 'None',
-                        'ArtifactType': 'FILESYSTEM',
-                        '_filepath': full_path,
-                        '_filename': name,
-                        '_extension': ext,
-                        '_size': size,
-                        '_is_dir': is_dir,
-                    })
-                    count[0] += 1
-                    
-                    if is_file and ext in ['.jpg', '.jpeg', '.png', '.pdf', '.doc', '.docx']:
-                        if count[0] % 100 == 0:
-                            print(f"   [FOUND] {full_path}")
+                ntype     = entry.info.name.type if entry.info.name else 0
+                meta_type = (entry.info.meta.type
+                             if entry.info.meta is not None else 0)
+                is_dir = (ntype == 2) or (meta_type == 2)
 
-                if is_dir and depth < max_depth:
-                    _walk(full_path, depth + 1, max_depth)
+                # Fallback for entries where type field is unreliable
+                if not is_dir and ntype not in (1, 2):
+                    try:
+                        fs.open_dir(full_path)
+                        is_dir = True
+                    except Exception:
+                        is_dir = False
+
+                if is_dir and name.lower() not in _SKIP_DIRS_LOWER:
+                    _walk(full_path, d + 1)
             except Exception:
                 continue
 
-    print("   Walking filesystem (Prioritizing /Users)...")
-    _walk("/Users")
-    print(f"   Cataloged {count[0]} user-profile entries")
-    
-    if count[0] < max_entries:
-        print("   Walking remaining filesystem...")
-        _walk("/")
-        
-    print(f"   Total filesystem entries cataloged: {count[0]}")
-    return pd.DataFrame(records)
+    _walk(start_path, depth)
+    return found
 
 
 def extract_all_evtx(fs):
-    """Extract ALL .evtx log files, not just Security.evtx."""
     all_evtx_frames = []
     evtx_dir_paths = [
         "/Windows/System32/winevt/Logs",
@@ -390,6 +430,9 @@ def extract_all_evtx(fs):
         except Exception:
             continue
 
+        if evtx_dir is None:
+            continue
+
         for entry in evtx_dir:
             try:
                 fname = entry.info.name.name.decode('utf-8', errors='ignore')
@@ -397,19 +440,18 @@ def extract_all_evtx(fs):
                     continue
                 fpath = f"{evtx_dir_path}/{fname}"
                 f_obj = fs.open(fpath)
-                if f_obj.info.meta.size < 1024:  # Skip tiny/empty logs
+                if f_obj.info.meta.size < 1024:
                     continue
                 evtx_data = f_obj.read_random(0, f_obj.info.meta.size)
                 evtx_df = parse_evtx_file(evtx_data)
                 if not evtx_df.empty:
-                    # Update LogSource to reflect which log file this came from
                     channel_name = fname.replace('.evtx', '').replace('%4', '/').upper()
                     evtx_df['LogSource'] = channel_name
                     all_evtx_frames.append(evtx_df)
                     print(f"   Extracted {len(evtx_df)} events from {fname}")
             except Exception:
                 continue
-        break  # Found the directory, stop trying alternatives
+        break
 
     if all_evtx_frames:
         return pd.concat(all_evtx_frames, ignore_index=True)
@@ -417,7 +459,6 @@ def extract_all_evtx(fs):
 
 
 def extract_sam_hive(fs):
-    """Parse the SAM registry hive to extract user account information."""
     from Registry import Registry as reg_lib
 
     sam_paths = [
@@ -439,24 +480,25 @@ def extract_sam_hive(fs):
 
         try:
             registry = reg_lib.Registry(tmp_path)
-            # Navigate to user accounts: SAM\Domains\Account\Users\Names
             try:
                 users_key = registry.open("SAM\\Domains\\Account\\Users")
                 names_key = users_key.subkey("Names")
                 rid_to_name = {}
                 for name_subkey in names_key.subkeys():
                     try:
-                        # The type of the default value is the RID
                         vals = [v for v in name_subkey.values()]
                         if vals:
                             rid_to_name[vals[0].value_type()] = name_subkey.name()
-                    except: pass
+                    except:
+                        pass
 
                 for subkey in users_key.subkeys():
-                    if subkey.name() == "Names": continue
+                    if subkey.name() == "Names":
+                        continue
                     try:
                         rid = int(subkey.name(), 16)
-                    except: continue
+                    except:
+                        continue
                     username = rid_to_name.get(rid, f"Unknown_RID_{subkey.name()}")
 
                     ts = subkey.timestamp()
@@ -468,15 +510,19 @@ def extract_sam_hive(fs):
                         import struct
                         last_logon_ft = struct.unpack('<Q', f_val[8:16])[0]
                         login_count = struct.unpack('<H', f_val[64:66])[0]
-                        
+
                         def ft_to_str(ft):
-                            if ft == 0 or ft == 0x7FFFFFFFFFFFFFFF: return "Never"
+                            if ft == 0 or ft == 0x7FFFFFFFFFFFFFFF:
+                                return "Never"
                             try:
-                                return (datetime(1601, 1, 1, tzinfo=timezone.utc) + timedelta(microseconds=ft//10)).strftime('%Y-%m-%d %H:%M:%S')
-                            except: return "N/A"
-                            
+                                return (datetime(1601, 1, 1, tzinfo=timezone.utc)
+                                        + timedelta(microseconds=ft // 10)).strftime('%Y-%m-%d %H:%M:%S')
+                            except:
+                                return "N/A"
+
                         ll_str = ft_to_str(last_logon_ft)
-                        desc = f"SAM User Account: {username} (RID: {rid}) | Login Count: {login_count} | Last Logon: {ll_str}"
+                        desc = (f"SAM User Account: {username} (RID: {rid}) | "
+                                f"Login Count: {login_count} | Last Logon: {ll_str}")
                     except Exception:
                         pass
 
@@ -498,13 +544,12 @@ def extract_sam_hive(fs):
                 os.unlink(tmp_path)
             except Exception:
                 pass
-        break  # Found it
+        break
 
     return pd.DataFrame(records)
 
 
 def extract_software_hive(fs):
-    """Parse the SOFTWARE registry hive for installed programs and OS info."""
     from Registry import Registry as reg_lib
 
     sw_paths = [
@@ -527,9 +572,9 @@ def extract_software_hive(fs):
         try:
             registry = reg_lib.Registry(tmp_path)
 
-            # Installed Programs
             uninstall_paths = [
                 "Microsoft\\Windows\\CurrentVersion\\Uninstall",
+                "Wow6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall",
             ]
             for upath in uninstall_paths:
                 try:
@@ -555,7 +600,10 @@ def extract_software_hive(fs):
                             records.append({
                                 'Date and Time': ts_str,
                                 'Event ID': '9200',
-                                'Task Category': f"Installed Program: {display_name} v{display_version} by {publisher} (Installed: {install_date or ts_str})",
+                                'Task Category': (
+                                    f"Installed Program: {display_name} v{display_version} "
+                                    f"by {publisher} (Installed: {install_date or ts_str})"
+                                ),
                                 'LogSource': 'SOFTWARE',
                                 'Keywords': 'None',
                                 'ArtifactType': 'SOFTWARE',
@@ -563,13 +611,13 @@ def extract_software_hive(fs):
                 except Exception:
                     pass
 
-            # OS Version Info
             try:
                 nt_key = registry.open("Microsoft\\Windows NT\\CurrentVersion")
                 os_info = {}
                 for val in nt_key.values():
                     vn = val.name()
-                    if vn in ['ProductName', 'BuildLab', 'RegisteredOwner', 'InstallDate', 'CurrentBuild', 'EditionID']:
+                    if vn in ['ProductName', 'BuildLab', 'RegisteredOwner',
+                              'InstallDate', 'CurrentBuild', 'EditionID']:
                         os_info[vn] = str(val.value())[:200]
                 if os_info:
                     ts = nt_key.timestamp()
@@ -582,6 +630,7 @@ def extract_software_hive(fs):
                         'LogSource': 'SOFTWARE',
                         'Keywords': 'Alert',
                         'ArtifactType': 'SOFTWARE',
+                        '_os_facts': os_info
                     })
             except Exception:
                 pass
@@ -599,8 +648,948 @@ def extract_software_hive(fs):
     return pd.DataFrame(records)
 
 
+def extract_usb_devices(fs):
+    from Registry import Registry as reg_lib
+    records = []
+
+    system_paths = ["/Windows/System32/config/SYSTEM", "/Windows/System32/config/system"]
+    reg_data = None
+    for p in system_paths:
+        try:
+            f_obj = fs.open(p)
+            reg_data = f_obj.read_random(0, f_obj.info.meta.size)
+            break
+        except:
+            continue
+
+    if not reg_data:
+        return pd.DataFrame()
+
+    with tempfile.NamedTemporaryFile(suffix=".hive", delete=False) as tmp:
+        tmp.write(reg_data)
+        tmp_path = tmp.name
+
+    try:
+        registry = reg_lib.Registry(tmp_path)
+        try:
+            usbstor_key = registry.open("ControlSet001\\Enum\\USBSTOR")
+            for vendor_key in usbstor_key.subkeys():
+                vendor_name = vendor_key.name()
+                for serial_key in vendor_key.subkeys():
+                    serial = serial_key.name()
+                    ts = serial_key.timestamp()
+                    ts_str = ts.strftime('%Y-%m-%d %H:%M:%S') if ts else 'N/A'
+
+                    friendly_name = "Unknown Device"
+                    try:
+                        friendly_name = str(serial_key.value("FriendlyName").value())
+                    except:
+                        pass
+
+                    records.append({
+                        'Date and Time': ts_str,
+                        'Event ID': '9000',
+                        'Task Category': (
+                            f"USB Device: {friendly_name} "
+                            f"(Vendor: {vendor_name}, Serial: {serial})"
+                        ),
+                        'LogSource': 'USB_HISTORY',
+                        'Keywords': 'Alert',
+                        'ArtifactType': 'USB',
+                    })
+        except:
+            pass
+
+        try:
+            usb_key = registry.open("ControlSet001\\Enum\\USB")
+            for vid_key in usb_key.subkeys():
+                for serial_key in vid_key.subkeys():
+                    try:
+                        dev_desc = "Unknown USB Device"
+                        for val_name in ["DeviceDesc", "FriendlyName"]:
+                            try:
+                                dev_desc = str(serial_key.value(val_name).value()).split(';')[-1]
+                                break
+                            except:
+                                pass
+
+                        ts = serial_key.timestamp()
+                        ts_str = ts.strftime('%Y-%m-%d %H:%M:%S UTC') if ts else 'N/A'
+
+                        records.append({
+                            'Date and Time': ts_str,
+                            'Event ID': '9001',
+                            'Task Category': (
+                                f"USB Device Attached: {dev_desc} "
+                                f"(ID: {vid_key.name()}\\{serial_key.name()})"
+                            ),
+                            'LogSource': 'USB_HISTORY',
+                            'Keywords': 'None',
+                            'ArtifactType': 'USB',
+                        })
+                    except:
+                        pass
+        except:
+            pass
+
+    except Exception as e:
+        print(f"   USB Extraction error: {e}")
+    finally:
+        os.unlink(tmp_path)
+
+    return pd.DataFrame(records)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# FIX-5: extract_all_ntuser — dir-type guard + cross-root deduplication
+# ═══════════════════════════════════════════════════════════════════════════
+
+def extract_all_ntuser(fs):
+    """Extract ALL NTUSER.DAT hive files from all user profiles."""
+    all_ntuser_frames = []
+    seen_paths = set()
+    _skip_names = {'all users', 'default', 'default user', 'public', '.', '..'}
+
+    try:
+        roots = get_user_roots(fs)
+        if not roots:
+            return pd.DataFrame()
+
+        for base_root in roots:
+            try:
+                users_dir = fs.open_dir(base_root)
+            except Exception:
+                continue
+
+            for entry in users_dir:
+                try:
+                    raw = entry.info.name.name
+                    name = (raw.decode('utf-8', errors='ignore')
+                            if isinstance(raw, bytes) else raw)
+                    if name.lower() in _skip_names:
+                        continue
+
+                    # FIX-5: verify it is a directory before proceeding
+                    ntype = entry.info.name.type
+                    meta_type = entry.info.meta.type if entry.info.meta else 0
+                    is_dir = (ntype == 2) or (meta_type == 2)
+                    if not is_dir:
+                        try:
+                            fs.open_dir(f"{base_root}/{name}")
+                            is_dir = True
+                        except Exception:
+                            is_dir = False
+                    if not is_dir:
+                        continue
+
+                    ntuser_path = f"{base_root}/{name}/NTUSER.DAT"
+                    norm = ntuser_path.lower()
+                    if norm in seen_paths:
+                        continue
+                    seen_paths.add(norm)
+
+                    try:
+                        f_obj = fs.open(ntuser_path)
+                        reg_data = f_obj.read_random(0, f_obj.info.meta.size)
+                        reg_df = parse_registry_hive(reg_data, f"NTUSER({name})")
+                        if not reg_df.empty:
+                            all_ntuser_frames.append(reg_df)
+                            print(f"  [NTUSER] Parsed {len(reg_df)} entries for user '{name}'")
+                    except Exception as e:
+                        if debug_extract:
+                            print(f"  [DEBUG] NTUSER.DAT not found for '{name}': {e}")
+                        continue
+                except Exception:
+                    continue
+    except Exception as e:
+        print(f"  [DEBUG] NTUSER walk error: {e}")
+
+    if all_ntuser_frames:
+        return pd.concat(all_ntuser_frames, ignore_index=True)
+    return pd.DataFrame()
+
+
+def extract_user_activity(fs):
+    records = []
+    try:
+        roots = get_user_roots(fs)
+        if not roots:
+            return pd.DataFrame(records)
+        skip_names = {'all users', 'default', 'default user', 'public', '.', '..'}
+        for base_root in roots:
+            try:
+                users_dir = fs.open_dir(base_root)
+            except Exception:
+                continue
+            for entry in users_dir:
+                name = entry.info.name.name.decode('utf-8', errors='ignore')
+                if name.lower() in skip_names:
+                    continue
+
+                recent_path = f"{base_root}/{name}/AppData/Roaming/Microsoft/Windows/Recent"
+                try:
+                    recent_dir = fs.open_dir(recent_path)
+                    if recent_dir is None:
+                        continue
+                    for lnk_entry in recent_dir:
+                        try:
+                            lname = lnk_entry.info.name.name.decode('utf-8', errors='ignore')
+                            if not lname.lower().endswith('.lnk'):
+                                continue
+                            f_obj = fs.open(f"{recent_path}/{lname}")
+                            data = f_obj.read_random(0, f_obj.info.meta.size)
+
+                            target_path = "Unknown"
+                            if b":\\" in data:
+                                start = data.find(b":\\") - 1
+                                end = data.find(b"\x00", start)
+                                target_path = data[start:end].decode('utf-16le', errors='ignore')
+                                if not target_path or ":" not in target_path:
+                                    target_path = data[start:end].decode('utf-8', errors='ignore')
+
+                            mtime = datetime.fromtimestamp(
+                                lnk_entry.info.meta.mtime, timezone.utc
+                            ).strftime('%Y-%m-%d %H:%M:%S')
+                            records.append({
+                                'Date and Time': mtime,
+                                'Event ID': '9400',
+                                'Task Category': (
+                                    f"User Activity (LNK): {name} opened "
+                                    f"{target_path} (LNK: {lname})"
+                                ),
+                                'LogSource': 'ACTIVITY',
+                                'Keywords': 'None',
+                                'ArtifactType': 'ACTIVITY',
+                            })
+                        except Exception:
+                            continue
+                except Exception:
+                    pass
+
+                jump_path = (f"{base_root}/{name}/AppData/Roaming/Microsoft/"
+                             f"Windows/Recent/AutomaticDestinations")
+                try:
+                    jump_dir = fs.open_dir(jump_path)
+                    if jump_dir is None:
+                        continue
+                    for j_entry in jump_dir:
+                        try:
+                            jname = j_entry.info.name.name.decode('utf-8', errors='ignore')
+                            mtime = datetime.fromtimestamp(
+                                j_entry.info.meta.mtime, timezone.utc
+                            ).strftime('%Y-%m-%d %H:%M:%S')
+                            records.append({
+                                'Date and Time': mtime,
+                                'Event ID': '9401',
+                                'Task Category': (
+                                    f"User Activity (JumpList): {name} "
+                                    f"interacted with AppID {jname[:8]}..."
+                                ),
+                                'LogSource': 'ACTIVITY',
+                                'Keywords': 'None',
+                                'ArtifactType': 'ACTIVITY',
+                            })
+                        except Exception:
+                            continue
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    return pd.DataFrame(records)
+
+
+def extract_recycle_bin(fs):
+    records = []
+    print("  [CARVE] Scanning for Recycle Bin artifacts (Global Search)...")
+
+    target_files = heuristic_discover_files(
+        fs, [r'^\$I', r'^\$R', r'^INFO2$'], max_depth=10
+    )
+    if not target_files:
+        recycle_dirs = heuristic_discover_files(
+            fs, [r'^\$Recycle\.Bin$', r'^RECYCLER$', r'^RECYCLED$'], max_depth=4
+        )
+        for rdir in recycle_dirs:
+            target_files.extend(
+                heuristic_discover_files(
+                    fs, [r'^\$I', r'^\$R', r'^INFO2$'],
+                    start_path=rdir, max_depth=6
+                )
+            )
+    if debug_extract:
+        print(f"  [DEBUG] Recycle Bin hits: {len(target_files)}")
+
+    for path in target_files:
+        try:
+            f_obj = fs.open(path)
+            meta = f_obj.info.meta
+            ts = datetime.fromtimestamp(meta.mtime, timezone.utc) if meta and meta.mtime else None
+            ts_str = ts.strftime('%Y-%m-%d %H:%M:%S UTC') if ts else 'N/A'
+
+            parts = path.split('/')
+            context = parts[-2] if len(parts) > 2 else "Unknown"
+
+            records.append({
+                'Date and Time': ts_str,
+                'Event ID': '9800',
+                'Task Category': (
+                    f"Recycle Bin: Found deleted artifact in "
+                    f"{context} (Path: {path})"
+                ),
+                'LogSource': 'RECYCLE_BIN',
+                'Keywords': 'Alert',
+                'ArtifactType': 'RECYCLE',
+            })
+        except Exception as e:
+            if debug_extract:
+                print(f"  [DEBUG] Recycle Bin read error for {path}: {e}")
+            continue
+    return pd.DataFrame(records)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# FIX-3: extract_browser_history — Firefox hashed-profile descent
+# ═══════════════════════════════════════════════════════════════════════════
+
+def extract_browser_history(fs):
+    """
+    Universal Browser Extractor.
+    Firefox hashed profile directories are now explicitly descended.
+    """
+    records = []
+    print("  [CARVE] Globally searching for Browser History & Bookmarks...")
+
+    # 1. Generic discovery for Chrome/Edge artifacts
+    generic_patterns = [r'^History$', r'^Bookmarks$', r'^Cookies$']
+    found_paths = []
+    roots = get_user_roots(fs)
+    search_bases = roots if roots else ["/"]
+
+    for root in search_bases:
+        found_paths.extend(
+            heuristic_discover_files(fs, generic_patterns,
+                                     start_path=root, max_depth=14)
+        )
+
+    # 2. Firefox-specific: manually descend hashed profile dirs
+    # Path: <root>/<user>/AppData/Roaming/Mozilla/Firefox/Profiles/<hash.name>/places.sqlite
+    firefox_targets = []
+    _skip = {'all users', 'default', 'default user', 'public', '.', '..'}
+
+    for root in search_bases:
+        try:
+            users_dir = fs.open_dir(root)
+            if users_dir is None:
+                continue
+        except Exception:
+            continue
+
+        for user_entry in users_dir:
+            try:
+                raw = user_entry.info.name.name
+                uname = (raw.decode('utf-8', errors='ignore')
+                         if isinstance(raw, bytes) else raw)
+                if uname.lower() in _skip:
+                    continue
+
+                # Verify it's a directory
+                ntype = user_entry.info.name.type
+                meta_type = user_entry.info.meta.type if user_entry.info.meta else 0
+                is_dir = (ntype == 2) or (meta_type == 2)
+                if not is_dir:
+                    try:
+                        fs.open_dir(f"{root}/{uname}")
+                        is_dir = True
+                    except Exception:
+                        is_dir = False
+                if not is_dir:
+                    continue
+
+                # Try Vista+ and XP AppData layouts
+                profiles_candidates = [
+                    f"{root}/{uname}/AppData/Roaming/Mozilla/Firefox/Profiles",
+                    f"{root}/{uname}/Application Data/Mozilla/Firefox/Profiles",
+                ]
+                for profiles_path in profiles_candidates:
+                    try:
+                        profiles_dir = fs.open_dir(profiles_path)
+                        if profiles_dir is None:
+                            continue
+                    except Exception:
+                        continue
+
+                    # Each child of Profiles/ is a hashed profile dir
+                    for prof_entry in profiles_dir:
+                        try:
+                            raw_p = prof_entry.info.name.name
+                            pname = (raw_p.decode('utf-8', errors='ignore')
+                                     if isinstance(raw_p, bytes) else raw_p)
+                            if pname in ('.', '..'):
+                                continue
+                            prof_path = f"{profiles_path}/{pname}"
+                            for fname in ('places.sqlite', 'cookies.sqlite'):
+                                target = f"{prof_path}/{fname}"
+                                try:
+                                    fs.open(target)
+                                    firefox_targets.append(target)
+                                    print(f"  [FF] Found Firefox artifact: {target}")
+                                except Exception:
+                                    pass
+                        except Exception:
+                            continue
+            except Exception:
+                continue
+
+    all_paths = list(dict.fromkeys(found_paths + firefox_targets))
+
+    if debug_extract:
+        preview = ", ".join(all_paths[:5]) if all_paths else "None"
+        print(f"  [DEBUG] Browser targets found: {len(all_paths)} | Sample: {preview}")
+
+    # 3. Parse each discovered artifact
+    for path in all_paths:
+        try:
+            f_obj = fs.open(path)
+            p_name = path.lower()
+
+            user_context = "Unknown"
+            for marker in ("/users/", "/documents and settings/"):
+                if marker in path.lower():
+                    idx = path.lower().index(marker) + len(marker)
+                    user_context = path[idx:].split("/")[0]
+                    break
+
+            # A. SQLite History / Firefox places.sqlite
+            if "history" in p_name or "places.sqlite" in p_name:
+                data = f_obj.read_random(0, f_obj.info.meta.size)
+                with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tmp:
+                    tmp.write(data)
+                    tmp_path = tmp.name
+                try:
+                    conn = sqlite3.connect(tmp_path)
+                    cursor = conn.cursor()
+                    if "places.sqlite" in p_name:
+                        try:
+                            cursor.execute(
+                                "SELECT url, title, visit_date "
+                                "FROM moz_places "
+                                "JOIN moz_historyvisits "
+                                "ON moz_places.id = moz_historyvisits.place_id "
+                                "ORDER BY visit_date DESC LIMIT 200"
+                            )
+                            for url, title, vdate in cursor.fetchall():
+                                dt = (datetime(1970, 1, 1, tzinfo=timezone.utc)
+                                      + timedelta(microseconds=vdate or 0))
+                                records.append({
+                                    'Date and Time': dt.strftime('%Y-%m-%d %H:%M:%S UTC'),
+                                    'Event ID': '9600',
+                                    'Task Category': f"Firefox History: {user_context} visited {url}",
+                                    'LogSource': 'BROWSER',
+                                    'Keywords': 'None',
+                                    'ArtifactType': 'BROWSER',
+                                })
+                        except Exception as e:
+                            print(f"  [WARN] Firefox history parse: {e}")
+                        try:
+                            cursor.execute(
+                                "SELECT moz_places.url, moz_bookmarks.title, "
+                                "moz_bookmarks.dateAdded "
+                                "FROM moz_bookmarks "
+                                "JOIN moz_places ON moz_bookmarks.fk = moz_places.id "
+                                "WHERE moz_bookmarks.fk IS NOT NULL LIMIT 200"
+                            )
+                            for url, title, date_added in cursor.fetchall():
+                                if date_added:
+                                    dt = (datetime(1970, 1, 1, tzinfo=timezone.utc)
+                                          + timedelta(microseconds=date_added))
+                                    ts_str = dt.strftime('%Y-%m-%d %H:%M:%S UTC')
+                                else:
+                                    ts_str = 'N/A'
+                                records.append({
+                                    'Date and Time': ts_str,
+                                    'Event ID': '9602',
+                                    'Task Category': (
+                                        f"Bookmark: {user_context} "
+                                        f"saved '{title}' -> {url}"
+                                    ),
+                                    'LogSource': 'BROWSER',
+                                    'Keywords': 'None',
+                                    'ArtifactType': 'BROWSER',
+                                })
+                        except Exception as e:
+                            print(f"  [WARN] Firefox bookmark parse: {e}")
+                    else:
+                        try:
+                            cursor.execute(
+                                "SELECT url, title, last_visit_time "
+                                "FROM urls ORDER BY last_visit_time DESC LIMIT 200"
+                            )
+                            for url, title, lvt in cursor.fetchall():
+                                dt = (datetime(1601, 1, 1, tzinfo=timezone.utc)
+                                      + timedelta(microseconds=lvt or 0))
+                                records.append({
+                                    'Date and Time': dt.strftime('%Y-%m-%d %H:%M:%S UTC'),
+                                    'Event ID': '9600',
+                                    'Task Category': (
+                                        f"Browser History: {user_context} visited {url}"
+                                    ),
+                                    'LogSource': 'BROWSER',
+                                    'Keywords': 'None',
+                                    'ArtifactType': 'BROWSER',
+                                })
+                        except Exception as e:
+                            print(f"  [WARN] Chrome/Edge history parse: {e}")
+                    conn.close()
+                finally:
+                    try:
+                        os.unlink(tmp_path)
+                    except Exception:
+                        pass
+
+            # B. JSON Bookmarks (Chrome/Edge)
+            elif "bookmarks" in p_name and not p_name.endswith(".sqlite"):
+                data = f_obj.read_random(0, f_obj.info.meta.size)
+                try:
+                    b_json = json.loads(data.decode('utf-8', errors='ignore'))
+
+                    def walk_bm(node):
+                        if isinstance(node, dict):
+                            if node.get('type') == 'url':
+                                records.append({
+                                    'Date and Time': 'N/A',
+                                    'Event ID': '9602',
+                                    'Task Category': (
+                                        f"Bookmark: {user_context} saved "
+                                        f"'{node.get('name')}' -> {node.get('url')}"
+                                    ),
+                                    'LogSource': 'BROWSER',
+                                    'Keywords': 'None',
+                                    'ArtifactType': 'BROWSER',
+                                })
+                            for v in node.values():
+                                walk_bm(v)
+                        elif isinstance(node, list):
+                            for item in node:
+                                walk_bm(item)
+
+                    walk_bm(b_json.get('roots', {}))
+                except Exception as e:
+                    print(f"  [WARN] Bookmarks JSON parse for {path}: {e}")
+
+            # C. Cookies
+            elif p_name.endswith("/cookies") or "cookies.sqlite" in p_name:
+                data = f_obj.read_random(0, f_obj.info.meta.size)
+                with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tmp:
+                    tmp.write(data)
+                    tmp_path = tmp.name
+                try:
+                    conn = sqlite3.connect(tmp_path)
+                    cursor = conn.cursor()
+                    if "cookies.sqlite" in p_name:
+                        cursor.execute(
+                            "SELECT host, name, lastAccessed "
+                            "FROM moz_cookies ORDER BY lastAccessed DESC LIMIT 200"
+                        )
+                        for host, name, last_access in cursor.fetchall():
+                            dt = (datetime(1970, 1, 1, tzinfo=timezone.utc)
+                                  + timedelta(microseconds=last_access or 0))
+                            records.append({
+                                'Date and Time': dt.strftime('%Y-%m-%d %H:%M:%S UTC'),
+                                'Event ID': '9603',
+                                'Task Category': f"Cookie: {user_context} {host} -> {name}",
+                                'LogSource': 'BROWSER',
+                                'Keywords': 'None',
+                                'ArtifactType': 'BROWSER',
+                            })
+                    else:
+                        cursor.execute(
+                            "SELECT host_key, name, last_access_utc "
+                            "FROM cookies ORDER BY last_access_utc DESC LIMIT 200"
+                        )
+                        for host, name, last_access in cursor.fetchall():
+                            dt = (datetime(1601, 1, 1, tzinfo=timezone.utc)
+                                  + timedelta(microseconds=last_access or 0))
+                            records.append({
+                                'Date and Time': dt.strftime('%Y-%m-%d %H:%M:%S UTC'),
+                                'Event ID': '9603',
+                                'Task Category': f"Cookie: {user_context} {host} -> {name}",
+                                'LogSource': 'BROWSER',
+                                'Keywords': 'None',
+                                'ArtifactType': 'BROWSER',
+                            })
+                    conn.close()
+                finally:
+                    try:
+                        os.unlink(tmp_path)
+                    except Exception:
+                        pass
+
+        except Exception as e:
+            if debug_extract:
+                print(f"  [DEBUG] Browser parse error for {path}: {e}")
+            continue
+
+    print(f"  [BROWSER] Extracted {len(records)} browser artifacts")
+    return pd.DataFrame(records)
+
+
+def walk_filesystem(fs, limit=150000, max_depth=14):
+    records = []
+    print("  [CARVE] Indexing Filesystem (Autopsy Mode)...")
+
+    skip_dirs = {'winsxs', 'servicing', 'driverstore',
+                 'system32', 'program files', 'program files (x86)'}
+
+    def fast_walk(directory_path, depth=0):
+        if len(records) >= limit or depth > max_depth:
+            return
+        try:
+            dir_obj = fs.open_dir(directory_path)
+            if dir_obj is None:
+                return
+            for entry in dir_obj:
+                if len(records) >= limit:
+                    return
+                try:
+                    name = entry.info.name.name.decode('utf-8', errors='ignore')
+                    if name in ['.', '..']:
+                        continue
+                    fpath = (f"{directory_path}/{name}"
+                             if directory_path != "/" else f"/{name}")
+
+                    meta = entry.info.meta
+                    ntype = entry.info.name.type
+                    meta_type = meta.type if meta else None
+                    is_file = (ntype == 1) or (meta_type == 1)
+                    is_dir = (ntype == 2) or (meta_type == 2)
+                    if not is_dir and ntype not in (1, 2):
+                        try:
+                            fs.open_dir(fpath)
+                            is_dir = True
+                        except Exception:
+                            is_dir = False
+                    ext = os.path.splitext(name)[1].lower() if is_file else ''
+                    mtime = (datetime.fromtimestamp(meta.mtime, timezone.utc)
+                             .strftime('%Y-%m-%d %H:%M:%S UTC')
+                             if meta and meta.mtime else 'N/A')
+                    size = meta.size if meta and meta.size else 0
+
+                    if is_file or is_dir:
+                        ftype = "Directory" if is_dir else "File"
+                        records.append({
+                            'Date and Time': mtime,
+                            'Event ID': '9100',
+                            'Task Category': (
+                                f"{ftype} Discovery: {name} "
+                                f"({ext.upper()}) at {fpath}"
+                            ),
+                            'LogSource': 'FILESYSTEM',
+                            'Keywords': 'None',
+                            'ArtifactType': 'FILESYSTEM',
+                            '_filepath': fpath,
+                            '_filename': name,
+                            '_extension': ext,
+                            '_size': size,
+                            '_is_dir': is_dir,
+                        })
+
+                    if is_dir and depth < max_depth and name.lower() not in skip_dirs:
+                        fast_walk(fpath, depth + 1)
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+    for root in ["/Users", "/USERS",
+                 "/Documents and Settings", "/DOCUMENTS AND SETTINGS"]:
+        fast_walk(root)
+    if len(records) < limit:
+        fast_walk("/")
+
+    print(f"  [OK] Indexed {len(records)} files/folders.")
+    return pd.DataFrame(records)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# FIX-6: extract_communication_artifacts — wider depth; all roots searched
+# ═══════════════════════════════════════════════════════════════════════════
+
+def extract_communication_artifacts(fs):
+    """Discover email databases and communication artifacts."""
+    records = []
+    print("   Scanning for communication artifacts (expanded depth)...")
+
+    email_patterns = [r'^.*\.(pst|ost|msg|eml|mbox)$']
+    found_paths = []
+
+    roots = get_user_roots(fs) or ["/"]
+    for root in roots:
+        found_paths.extend(
+            heuristic_discover_files(
+                fs, email_patterns, start_path=root, max_depth=14
+            )
+        )
+    # Also scan root for unusual placements
+    found_paths.extend(
+        heuristic_discover_files(fs, email_patterns, start_path="/", max_depth=10)
+    )
+    # Deduplicate (normalise to lowercase key)
+    seen = set()
+    deduped = []
+    for p in found_paths:
+        k = p.lower()
+        if k not in seen:
+            seen.add(k)
+            deduped.append(p)
+    found_paths = deduped
+
+    if debug_extract:
+        preview = ", ".join(found_paths[:5]) if found_paths else "None"
+        print(f"  [DEBUG] Communication targets found: {len(found_paths)} | Sample: {preview}")
+
+    for path in found_paths:
+        try:
+            f_obj = fs.open(path)
+            meta = f_obj.info.meta
+            ext = os.path.splitext(path)[1].lower()
+            mtime = (datetime.fromtimestamp(meta.mtime, timezone.utc)
+                     .strftime('%Y-%m-%d %H:%M:%S')
+                     if meta and meta.mtime else 'N/A')
+            size = meta.size if meta and meta.size else 0
+            records.append({
+                'Date and Time': mtime,
+                'Event ID': '9900',
+                'Task Category': (
+                    f"Communication File: Found {ext.upper()} archive "
+                    f"at {path} (Size: {size:,} bytes)"
+                ),
+                'LogSource': 'COMMUNICATION',
+                'Keywords': 'Alert',
+                'ArtifactType': 'COMMUNICATION',
+            })
+        except Exception:
+            continue
+
+    print(f"  [COMM] Extracted {len(records)} communication artifacts")
+    return pd.DataFrame(records)
+
+
+def extract_usn_journal(fs):
+    records = []
+    try:
+        usn_path = "/$Extend/$UsnJrnl"
+        f_obj = fs.open(usn_path)
+        size = f_obj.info.meta.size
+        read_size = min(size, 2 * 1024 * 1024)
+        data = f_obj.read_random(size - read_size, read_size)
+
+        for match in re.finditer(br'[A-Za-z0-9._-]{5,}\.[a-zA-Z]{2,4}', data):
+            try:
+                fname = match.group().decode('utf-8', errors='ignore')
+                records.append({
+                    'Date and Time': datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S'),
+                    'Event ID': '9700',
+                    'Task Category': (
+                        f"USN Journal Activity: File modification detected for {fname}"
+                    ),
+                    'LogSource': 'USN',
+                    'Keywords': 'None',
+                    'ArtifactType': 'USN',
+                })
+                if len(records) > 200:
+                    break
+            except:
+                continue
+    except:
+        pass
+    return pd.DataFrame(records)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# FIX-8: extract_execution_history — guard against None current_audit_df
+# ═══════════════════════════════════════════════════════════════════════════
+
+def extract_execution_history(fs):
+    """
+    ShimCache data is already captured by extract_system_artifact() under
+    REGISTRY. current_audit_df is None at extraction time, so attempting
+    to read it here would crash. Return empty; data is available via RAG.
+    """
+    print("  [EXEC] ShimCache captured via REGISTRY extraction; skipping re-extraction.")
+    return pd.DataFrame()
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# FIX-7: extract_srum_data — isolated; 7 case-variant probes
+# ═══════════════════════════════════════════════════════════════════════════
+
+def extract_srum_data(fs):
+    """SRUM database extractor with expanded case-variant path probing."""
+    records = []
+
+    srum_paths = [
+        "/Windows/System32/sru/SRUDB.dat",
+        "/Windows/System32/sru/srudb.dat",
+        "/Windows/System32/SRU/SRUDB.DAT",
+        "/Windows/System32/SRU/SRUDB.dat",
+        "/WINDOWS/System32/sru/SRUDB.dat",
+        "/WINDOWS/System32/SRU/SRUDB.DAT",
+        "/windows/system32/sru/srudb.dat",
+    ]
+
+    for srum_path in srum_paths:
+        try:
+            f_obj = fs.open(srum_path)
+            mtime = (datetime.fromtimestamp(f_obj.info.meta.mtime, timezone.utc)
+                     .strftime('%Y-%m-%d %H:%M:%S'))
+            size = f_obj.info.meta.size if f_obj.info.meta else 0
+            records.append({
+                'Date and Time': mtime,
+                'Event ID': '9901',
+                'Task Category': (
+                    f"SRUM Database detected at {srum_path} "
+                    f"(Size: {size:,} bytes). "
+                    "Network and energy usage history available."
+                ),
+                'LogSource': 'SRUM',
+                'Keywords': 'Alert',
+                'ArtifactType': 'SRUM',
+            })
+            print(f"  [SRUM] Found SRUDB.dat at {srum_path}")
+            return pd.DataFrame(records)
+        except Exception:
+            continue
+
+    # Fallback: heuristic search
+    print("  [SRUM] Probing via heuristic search...")
+    found_paths = heuristic_discover_files(
+        fs, [r'^SRUDB\.dat$', r'^srudb\.dat$'],
+        start_path="/", max_depth=10
+    )
+    for path in found_paths:
+        try:
+            f_obj = fs.open(path)
+            mtime = (datetime.fromtimestamp(f_obj.info.meta.mtime, timezone.utc)
+                     .strftime('%Y-%m-%d %H:%M:%S'))
+            size = f_obj.info.meta.size if f_obj.info.meta else 0
+            records.append({
+                'Date and Time': mtime,
+                'Event ID': '9901',
+                'Task Category': (
+                    f"SRUM Database detected at {path} "
+                    f"(Size: {size:,} bytes). "
+                    "Network and energy usage history available."
+                ),
+                'LogSource': 'SRUM',
+                'Keywords': 'Alert',
+                'ArtifactType': 'SRUM',
+            })
+            break
+        except Exception:
+            continue
+
+    if not records:
+        print("  [SRUM] No SRUDB.dat found on this image.")
+    return pd.DataFrame(records)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# FIX-4: extract_recent_documents — dir-type guard
+# ═══════════════════════════════════════════════════════════════════════════
+
+def extract_recent_documents(fs):
+    """Extract .lnk files from Recent Documents folders for all user profiles."""
+    records = []
+    _skip_names = {'all users', 'default', 'default user', 'public', '.', '..'}
+
+    try:
+        roots = get_user_roots(fs)
+        if not roots:
+            return pd.DataFrame()
+        if debug_extract:
+            print(f"  [DEBUG] RecentDocs base roots: {', '.join(roots)}")
+
+        for base_root in roots:
+            try:
+                users_dir = fs.open_dir(base_root)
+            except Exception as e:
+                if debug_extract:
+                    print(f"  [DEBUG] RecentDocs open root failed: {base_root} -> {e}")
+                continue
+
+            for user_entry in users_dir:
+                try:
+                    raw = user_entry.info.name.name
+                    name = (raw.decode('utf-8', errors='ignore')
+                            if isinstance(raw, bytes) else raw)
+                    if name.lower() in _skip_names:
+                        continue
+
+                    # FIX-4: verify it is actually a directory
+                    ntype = user_entry.info.name.type
+                    meta_type = (user_entry.info.meta.type
+                                 if user_entry.info.meta else 0)
+                    is_dir = (ntype == 2) or (meta_type == 2)
+                    if not is_dir:
+                        try:
+                            fs.open_dir(f"{base_root}/{name}")
+                            is_dir = True
+                        except Exception:
+                            is_dir = False
+                    if not is_dir:
+                        continue
+
+                    recent_candidates = [
+                        f"{base_root}/{name}/AppData/Roaming/Microsoft/Windows/Recent",
+                        f"{base_root}/{name}/Recent",
+                    ]
+                    for recent_path in recent_candidates:
+                        try:
+                            recent_dir = fs.open_dir(recent_path)
+                            if recent_dir is None:
+                                continue
+                        except Exception:
+                            continue
+
+                        for lnk_entry in recent_dir:
+                            try:
+                                raw_l = lnk_entry.info.name.name
+                                lnk_name = (raw_l.decode('utf-8', errors='ignore')
+                                            if isinstance(raw_l, bytes) else raw_l)
+                                if lnk_name in ('.', '..'):
+                                    continue
+                                if not lnk_name.lower().endswith('.lnk'):
+                                    continue
+
+                                meta = lnk_entry.info.meta
+                                ts = (datetime.fromtimestamp(meta.mtime, timezone.utc)
+                                      if meta and meta.mtime else None)
+                                ts_str = ts.strftime('%Y-%m-%d %H:%M:%S UTC') if ts else 'N/A'
+
+                                records.append({
+                                    'Date and Time': ts_str,
+                                    'Event ID': '9700',
+                                    'Task Category': (
+                                        f"Recent Document: {name} accessed '{lnk_name}'"
+                                    ),
+                                    'LogSource': 'RECENT',
+                                    'Keywords': 'Alert',
+                                    'ArtifactType': 'RECENT',
+                                })
+                            except Exception:
+                                continue
+                        break  # Found valid Recent dir; stop trying alternatives
+                except Exception:
+                    continue
+    except Exception as e:
+        if debug_extract:
+            print(f"  [DEBUG] RecentDocs error: {e}")
+
+    print(f"  [RECENT] Extracted {len(records)} recent-document entries")
+    return pd.DataFrame(records)
+
+
 def extract_prefetch(fs):
-    """Extract Prefetch file listings to identify executed programs."""
     records = []
     prefetch_paths = [
         "/Windows/Prefetch",
@@ -613,6 +1602,9 @@ def extract_prefetch(fs):
         except Exception:
             continue
 
+        if pf_dir is None:
+            continue
+
         for entry in pf_dir:
             try:
                 fname = entry.info.name.name.decode('utf-8', errors='ignore')
@@ -621,14 +1613,20 @@ def extract_prefetch(fs):
                 if not fname.lower().endswith('.pf'):
                     continue
                 meta = entry.info.meta
-                mtime = datetime.fromtimestamp(meta.mtime, timezone.utc).strftime('%Y-%m-%d %H:%M:%S') if meta and meta.mtime and meta.mtime > 0 else 'N/A'
-                crtime = datetime.fromtimestamp(meta.crtime, timezone.utc).strftime('%Y-%m-%d %H:%M:%S') if meta and meta.crtime and meta.crtime > 0 else 'N/A'
-                # Prefetch filename format: PROGRAMNAME-HASH.pf
+                mtime = (datetime.fromtimestamp(meta.mtime, timezone.utc)
+                         .strftime('%Y-%m-%d %H:%M:%S')
+                         if meta and meta.mtime and meta.mtime > 0 else 'N/A')
+                crtime = (datetime.fromtimestamp(meta.crtime, timezone.utc)
+                          .strftime('%Y-%m-%d %H:%M:%S')
+                          if meta and meta.crtime and meta.crtime > 0 else 'N/A')
                 prog_name = fname.rsplit('-', 1)[0] if '-' in fname else fname.replace('.pf', '')
                 records.append({
                     'Date and Time': mtime,
                     'Event ID': '9300',
-                    'Task Category': f"Prefetch: {prog_name} (File: {fname}, Last Run: {mtime}, Created: {crtime})",
+                    'Task Category': (
+                        f"Prefetch: {prog_name} "
+                        f"(File: {fname}, Last Run: {mtime}, Created: {crtime})"
+                    ),
                     'LogSource': 'PREFETCH',
                     'Keywords': 'None',
                     'ArtifactType': 'PREFETCH',
@@ -641,123 +1639,9 @@ def extract_prefetch(fs):
     return pd.DataFrame(records)
 
 
-def carve_evidence_from_image(filepath):
-    """
-    Open a forensic disk image with pytsk3 and extract ALL evidence:
-      - All .evtx log files (Security, System, Application, PowerShell, etc.)
-      - SYSTEM, SAM, SOFTWARE registry hives
-      - NTUSER.DAT (all user profiles)
-      - Full filesystem metadata (file/directory listing)
-      - Prefetch files (executed programs)
-    Raises on any failure — no silent fallbacks.
-    """
-    global artifact_counts
-    all_frames = []
-    artifact_counts = {"evtx": 0, "registry": 0, "filesystem": 0, "sam": 0, "software": 0, "prefetch": 0, "total": 0}
-
-    import pytsk3
-    
-    # Check if file is E01 and use pyewf if available
-    is_e01 = filepath.lower().endswith('.e01')
-    if is_e01:
-        try:
-            import pyewf
-            ewf_handle = pyewf.handle()
-            ewf_handle.open([filepath])
-            img_info = EWFImgInfo(ewf_handle)
-            print("  [OK] Opened E01 image using libewf-python")
-        except ImportError:
-            raise RuntimeError("[ERROR] libewf-python is required to read .E01 files. Run: pip install libewf-python")
-    else:
-        # Open raw image directly with pytsk3
-        img_info = pytsk3.Img_Info(filepath)
-
-    # Try to dynamically detect partition offsets
-    fs = None
-    offsets_to_try = [0, 1048576, 65536, 32256]
-    try:
-        volume = pytsk3.Volume_Info(img_info)
-        for part in volume:
-            if part.flags == pytsk3.TSK_VS_PART_FLAG_ALLOC:
-                offset = part.start * volume.info.block_size
-                if offset not in offsets_to_try:
-                    offsets_to_try.insert(0, offset)  # Prioritize actual partition offsets
-    except Exception as e:
-        print(f"   Could not read volume/partition table: {e}")
-
-    # Attempt to mount filesystem at the discovered offsets
-    for offset in offsets_to_try:
-        try:
-            fs = pytsk3.FS_Info(img_info, offset=offset)
-            print(f"  [OK] Filesystem found at offset {offset}")
-            break
-        except Exception:
-            continue
-    else:
-        # Loop finished without break
-        raise RuntimeError(
-            f"[ERROR] No filesystem found in image '{os.path.basename(filepath)}'. "
-            f"Tried offsets: {offsets_to_try}. "
-            f"If this is an .E01 file, your pytsk3 installation might not include libewf support. "
-            f"Try converting the .E01 to a raw .dd image using FTK Imager."
-        )
-
-    # ── PARALLEL EXTRACTION ENGINE (PHASE 1) ──
-    print(f"  [EXEC] Starting parallel artifact extraction (Max Workers: 10)...")
-    
-    tasks = [
-        ("EVTX", extract_all_evtx, (fs,)),
-        ("SAM", extract_sam_hive, (fs,)),
-        ("SOFTWARE", extract_software_hive, (fs,)),
-        ("SYSTEM", extract_system_artifact, (fs,)),
-        ("NTUSER", extract_all_ntuser, (fs,)),
-        ("PREFETCH", extract_prefetch, (fs,)),
-        ("FILESYSTEM", walk_filesystem, (fs, 50000)),
-        ("ACTIVITY", extract_user_activity, (fs,)),
-        ("RECYCLE", extract_recycle_bin, (fs,)),
-        ("BROWSER", extract_browser_history, (fs,)),
-        ("USN", extract_usn_journal, (fs,)),
-        ("EXECUTION", extract_execution_history, (fs,)),
-        ("SRUM", extract_srum_data, (fs,))
-    ]
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=14) as executor:
-        future_to_name = {executor.submit(fn, *args): name for name, fn, args in tasks}
-        for future in concurrent.futures.as_completed(future_to_name):
-            name = future_to_name[future]
-            try:
-                df = future.result()
-                if df is not None and not df.empty:
-                    all_frames.append(df)
-                    # Update global artifact counts
-                    atype = df['ArtifactType'].iloc[0].lower() if 'ArtifactType' in df.columns else name.lower()
-                    if atype == 'registry': atype = 'registry' # Registry is summed across multiple
-                    
-                    if name == "EVTX": artifact_counts["evtx"] = len(df)
-                    elif name == "SAM": artifact_counts["sam"] = len(df)
-                    elif name == "SOFTWARE": artifact_counts["software"] = len(df)
-                    elif name == "SYSTEM": artifact_counts["registry"] += len(df)
-                    elif name == "NTUSER": artifact_counts["registry"] += len(df)
-                    elif name == "PREFETCH": artifact_counts["prefetch"] = len(df)
-                    elif name == "FILESYSTEM": artifact_counts["filesystem"] = len(df)
-                    
-                    print(f"  [OK] {name} extraction complete: {len(df)} entries")
-            except Exception as exc:
-                print(f"  [FAIL] {name} extraction generated an exception: {exc}")
-
-    if not all_frames:
-        raise RuntimeError(
-            f"[ERROR] No artifacts could be extracted from '{os.path.basename(filepath)}'. "
-            f"The filesystem was found but contained no recognizable artifacts."
-        )
-
-    result = pd.concat(all_frames, ignore_index=True)
-    artifact_counts["total"] = len(result)
-    return result
-
 def extract_system_artifact(fs):
-    """Wrapper for SYSTEM hive extraction."""
-    system_paths = ["/Windows/System32/config/SYSTEM", "/Windows/System32/config/system"]
+    system_paths = ["/Windows/System32/config/SYSTEM",
+                    "/Windows/System32/config/system"]
     for sys_path in system_paths:
         try:
             f_obj = fs.open(sys_path)
@@ -767,259 +1651,152 @@ def extract_system_artifact(fs):
             continue
     return pd.DataFrame()
 
-def extract_all_ntuser(fs):
-    """Extract ALL NTUSER.DAT files from all user profiles."""
-    all_ntuser_frames = []
-    try:
-        users_dir = fs.open_dir("/Users")
-        for entry in users_dir:
-            name = entry.info.name.name.decode('utf-8', errors='ignore')
-            if name in ['.', '..', 'Public', 'Default', 'Default User', 'All Users']:
-                continue
-            ntuser_path = f"/Users/{name}/NTUSER.DAT"
-            try:
-                f_obj = fs.open(ntuser_path)
-                reg_data = f_obj.read_random(0, f_obj.info.meta.size)
-                reg_df = parse_registry_hive(reg_data, f"NTUSER({name})")
-                if not reg_df.empty:
-                    all_ntuser_frames.append(reg_df)
-            except Exception:
-                continue
-    except Exception:
-        pass
-    
-    if all_ntuser_frames:
-        return pd.concat(all_ntuser_frames, ignore_index=True)
-    return pd.DataFrame()
 
-def extract_user_activity(fs):
-    """Extract LNK files and Jump Lists from all user profiles."""
-    records = []
-    try:
-        users_dir = fs.open_dir("/Users")
-        for entry in users_dir:
-            name = entry.info.name.name.decode('utf-8', errors='ignore')
-            if name in ['.', '..', 'Public', 'Default', 'Default User', 'All Users']:
-                continue
-            
-            # 1. Recent Items (.lnk files)
-            recent_path = f"/Users/{name}/AppData/Roaming/Microsoft/Windows/Recent"
-            try:
-                recent_dir = fs.open_dir(recent_path)
-                for lnk_entry in recent_dir:
-                    try:
-                        lname = lnk_entry.info.name.name.decode('utf-8', errors='ignore')
-                        if not lname.lower().endswith('.lnk'): continue
-                        f_obj = fs.open(f"{recent_path}/{lname}")
-                        data = f_obj.read_random(0, f_obj.info.meta.size)
-                        
-                        # Basic LNK parsing: look for target path (simplified)
-                        target_path = "Unknown"
-                        if b":\\" in data:
-                            start = data.find(b":\\") - 1
-                            end = data.find(b"\x00", start)
-                            target_path = data[start:end].decode('utf-16le', errors='ignore')
-                            if not target_path or ":" not in target_path:
-                                target_path = data[start:end].decode('utf-8', errors='ignore')
-                        
-                        mtime = datetime.fromtimestamp(lnk_entry.info.meta.mtime, timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
-                        records.append({
-                            'Date and Time': mtime,
-                            'Event ID': '9400',
-                            'Task Category': f"User Activity (LNK): {name} opened {target_path} (LNK: {lname})",
-                            'LogSource': 'ACTIVITY',
-                            'Keywords': 'None',
-                            'ArtifactType': 'ACTIVITY',
-                        })
-                    except: continue
-            except: pass
+# ═══════════════════════════════════════════════════════════════════════════
+# FIX-9: carve_evidence_from_image — SRUM/EXECUTION properly isolated
+# ═══════════════════════════════════════════════════════════════════════════
 
-            # 2. Jump Lists
-            jump_path = f"/Users/{name}/AppData/Roaming/Microsoft/Windows/Recent/AutomaticDestinations"
-            try:
-                jump_dir = fs.open_dir(jump_path)
-                for j_entry in jump_dir:
-                    try:
-                        jname = j_entry.info.name.name.decode('utf-8', errors='ignore')
-                        mtime = datetime.fromtimestamp(j_entry.info.meta.mtime, timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
-                        records.append({
-                            'Date and Time': mtime,
-                            'Event ID': '9401',
-                            'Task Category': f"User Activity (JumpList): {name} interacted with AppID {jname[:8]}...",
-                            'LogSource': 'ACTIVITY',
-                            'Keywords': 'None',
-                            'ArtifactType': 'ACTIVITY',
-                        })
-                    except: continue
-            except: pass
-    except: pass
-    return pd.DataFrame(records)
+def carve_evidence_from_image(image_source):
+    """
+    Open a forensic disk image with pytsk3 and extract ALL evidence.
+    image_source: Can be a single string path or a list of strings.
+    """
+    global artifact_counts
+    all_frames = []
+    artifact_counts = {
+        "evtx": 0, "registry": 0, "filesystem": 0,
+        "sam": 0, "software": 0, "prefetch": 0, "total": 0
+    }
 
-def extract_recycle_bin(fs):
-    """Extract Recycle Bin metadata ($I files)."""
-    records = []
-    recycle_paths = ["/$Recycle.Bin", "/$RECYCLE.BIN"]
-    for rb_path in recycle_paths:
+    import pytsk3
+
+    filepaths = image_source if isinstance(image_source, list) else [image_source]
+    primary_file = filepaths[0]
+
+    is_e01 = primary_file.lower().endswith('.e01')
+    if is_e01:
         try:
-            rb_dir = fs.open_dir(rb_path)
-            for sid_entry in rb_dir:
-                try:
-                    sid_name = sid_entry.info.name.name.decode('utf-8', errors='ignore')
-                    if sid_name in ['.', '..']: continue
-                    sid_path = f"{rb_path}/{sid_name}"
-                    sid_dir = fs.open_dir(sid_path)
-                    for f_entry in sid_dir:
-                        try:
-                            fname = f_entry.info.name.name.decode('utf-8', errors='ignore')
-                            if not fname.startswith('$I'): continue
-                            f_obj = fs.open(f"{sid_path}/{fname}")
-                            data = f_obj.read_random(0, f_obj.info.meta.size)
-                            
-                            import struct
-                            # $I file format: 8 bytes header, 8 bytes size, 8 bytes deletion time, then path
-                            del_time_ft = struct.unpack('<Q', data[16:24])[0]
-                            orig_path = data[24:].decode('utf-16le', errors='ignore').split('\x00')[0]
-                            
-                            def ft_to_str(ft):
-                                try:
-                                    return (datetime(1601, 1, 1, tzinfo=timezone.utc) + timedelta(microseconds=ft//10)).strftime('%Y-%m-%d %H:%M:%S')
-                                except: return "N/A"
-                            
-                            dtime = ft_to_str(del_time_ft)
-                            records.append({
-                                'Date and Time': dtime,
-                                'Event ID': '9500',
-                                'Task Category': f"Recycle Bin: File {orig_path} was deleted at {dtime}",
-                                'LogSource': 'RECYCLE',
-                                'Keywords': 'Alert',
-                                'ArtifactType': 'RECYCLE',
-                            })
-                        except: continue
-                except: continue
-            break
-        except: continue
-    return pd.DataFrame(records)
+            import pyewf
+            ewf_handle = pyewf.handle()
+            ewf_handle.open(filepaths)
 
-
-
-def extract_browser_history(fs):
-    """Extract Chrome/Edge history using temporary copies to avoid locking."""
-    records = []
-    try:
-        users_dir = fs.open_dir("/Users")
-        for entry in users_dir:
-            name = entry.info.name.name.decode('utf-8', errors='ignore')
-            if name in ['.', '..', 'Public', 'Default', 'Default User', 'All Users']: continue
-            
-            history_paths = [
-                f"/Users/{name}/AppData/Local/Google/Chrome/User Data/Default/History",
-                f"/Users/{name}/AppData/Local/Microsoft/Edge/User Data/Default/History"
-            ]
-            for h_path in history_paths:
-                try:
-                    f_obj = fs.open(h_path)
-                    h_data = f_obj.read_random(0, f_obj.info.meta.size)
-                    
-                    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tmp:
-                        tmp.write(h_data)
-                        tmp_path = tmp.name
-                    
-                    try:
-                        conn = sqlite3.connect(tmp_path)
-                        cursor = conn.cursor()
-                        cursor.execute("SELECT url, title, last_visit_time FROM urls ORDER BY last_visit_time DESC LIMIT 100")
-                        for url, title, lvt in cursor.fetchall():
-                            # Chrome time is microseconds since 1601-01-01
-                            dt = datetime(1601, 1, 1, tzinfo=timezone.utc) + timedelta(microseconds=lvt)
-                            dt_str = dt.strftime('%Y-%m-%d %H:%M:%S')
-                            records.append({
-                                'Date and Time': dt_str,
-                                'Event ID': '9600',
-                                'Task Category': f"Browser History: {name} visited {url} ({title[:50]})",
-                                'LogSource': 'BROWSER',
-                                'Keywords': 'None',
-                                'ArtifactType': 'BROWSER',
-                            })
-                        conn.close()
-                    finally:
-                        os.unlink(tmp_path)
-                except: continue
-    except: pass
-    return pd.DataFrame(records)
-
-def extract_usn_journal(fs):
-    """Implement USN Journal tail-parsing (optimized)."""
-    records = []
-    try:
-        usn_path = "/$Extend/$UsnJrnl"
-        f_obj = fs.open(usn_path)
-        size = f_obj.info.meta.size
-        read_size = min(size, 2 * 1024 * 1024) 
-        data = f_obj.read_random(size - read_size, read_size)
-        
-        for match in re.finditer(br'[A-Za-z0-9._-]{5,}\.[a-zA-Z]{2,4}', data):
             try:
-                fname = match.group().decode('utf-8', errors='ignore')
-                records.append({
-                    'Date and Time': datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S'),
-                    'Event ID': '9700',
-                    'Task Category': f"USN Journal Activity: File modification detected for {fname}",
-                    'LogSource': 'USN',
-                    'Keywords': 'None',
-                    'ArtifactType': 'USN',
-                })
-                if len(records) > 200: break
-            except: continue
-    except: pass
-    return pd.DataFrame(records)
+                case_num = ewf_handle.get_header_value("case_number")
+                ev_num = ewf_handle.get_header_value("evidence_number")
+                print(f"  [VALIDATE] E01 Set Metadata -> Case: {case_num}, Evidence: {ev_num}")
+                if hasattr(ewf_handle, 'get_number_of_segment_files'):
+                    actual_segments = ewf_handle.get_number_of_segment_files()
+                    if actual_segments < len(filepaths):
+                        print(f"  [WARN] libewf only recognized {actual_segments} "
+                              f"of {len(filepaths)} files.")
+            except Exception as e:
+                print(f"  [WARN] Metadata validation skipped: {e}")
 
-def extract_execution_history(fs):
-    """Extract ShimCache (AppCompatCache) from SYSTEM hive."""
-    records = []
-    # Implementation logic for parsing the AppCompatCache binary blob from registry
-    # For now, we pull the paths extracted by the general registry parser that match 'AppCompatCache'
-    if current_audit_df is not None:
-        shim_entries = current_audit_df[current_audit_df['Task Category'].str.contains('AppCompatCache', na=False)]
-        for _, row in shim_entries.iterrows():
-            records.append({
-                'Date and Time': row['Date and Time'],
-                'Event ID': '9800',
-                'Task Category': f"Execution History (ShimCache): {row['Task Category']}",
-                'LogSource': 'EXECUTION',
-                'Keywords': 'None',
-                'ArtifactType': 'EXECUTION',
-            })
-    return pd.DataFrame(records)
+            img_info = EWFImgInfo(ewf_handle)
+            print(f"  [OK] Opened E01 image set ({len(filepaths)} files)")
+        except ImportError:
+            raise RuntimeError(
+                "[ERROR] libewf-python required for .E01 files. "
+                "Run: pip install libewf-python"
+            )
+    else:
+        img_info = pytsk3.Img_Info(primary_file)
 
-def extract_srum_data(fs):
-    """Background parser for SRUM (System Resource Usage Monitor) databases."""
-    records = []
-    srum_path = "/Windows/System32/sru/SRUDB.dat"
+    fs = None
+    offsets_to_try = [0, 1048576, 65536, 32256]
     try:
-        # SRUM is a complex ESE database; we'll catalog its presence and 
-        # extract basic metadata for this version.
-        f_obj = fs.open(srum_path)
-        mtime = datetime.fromtimestamp(f_obj.info.meta.mtime, timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
-        records.append({
-            'Date and Time': mtime,
-            'Event ID': '9900',
-            'Task Category': "SRUM Database detected. Proves network and energy usage history is available for deep analysis.",
-            'LogSource': 'SRUM',
-            'Keywords': 'Alert',
-            'ArtifactType': 'SRUM',
-        })
-    except: pass
-    return pd.DataFrame(records)
+        volume = pytsk3.Volume_Info(img_info)
+        for part in volume:
+            if part.flags == pytsk3.TSK_VS_PART_FLAG_ALLOC:
+                offset = part.start * volume.info.block_size
+                if offset not in offsets_to_try:
+                    offsets_to_try.insert(0, offset)
+    except Exception as e:
+        err_msg = str(e)
+        if "missing segment file" in err_msg.lower():
+            raise RuntimeError(
+                f"[ERROR] Split E01 Image Detected. Ensure all segments are uploaded. "
+                f"Internal Error: {err_msg}"
+            )
+        print(f"   Could not read volume/partition table: {e}")
 
+    for offset in offsets_to_try:
+        try:
+            fs = pytsk3.FS_Info(img_info, offset=offset)
+            print(f"  [OK] Filesystem found at offset {offset}")
+            break
+        except Exception:
+            continue
+    else:
+        img_name = os.path.basename(primary_file)
+        raise RuntimeError(
+            f"[ERROR] No filesystem found in image '{img_name}'. "
+            f"Tried offsets: {offsets_to_try}."
+        )
+
+    # FIX-9: SRUM and EXECUTION are independent named tasks
+    print(f"  [EXEC] Starting parallel artifact extraction (Max Workers: 14)...")
+
+    tasks = [
+        ("EVTX",          extract_all_evtx,               (fs,)),
+        ("SYSTEM",        extract_system_artifact,         (fs,)),
+        ("SAM",           extract_sam_hive,                (fs,)),
+        ("SOFTWARE",      extract_software_hive,           (fs,)),
+        ("USB",           extract_usb_devices,             (fs,)),
+        ("NTUSER",        extract_all_ntuser,              (fs,)),   # FIX-5
+        ("PREFETCH",      extract_prefetch,                (fs,)),
+        ("FILESYSTEM",    walk_filesystem,                 (fs, 150000)),
+        ("ACTIVITY",      extract_user_activity,           (fs,)),
+        ("RECENT",        extract_recent_documents,        (fs,)),   # FIX-4
+        ("RECYCLE",       extract_recycle_bin,             (fs,)),
+        ("BROWSER",       extract_browser_history,         (fs,)),   # FIX-3
+        ("COMMUNICATION", extract_communication_artifacts, (fs,)),   # FIX-6
+        ("USN",           extract_usn_journal,             (fs,)),
+        ("EXECUTION",     extract_execution_history,       (fs,)),   # FIX-8
+        ("SRUM",          extract_srum_data,               (fs,)),   # FIX-7
+    ]
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=14) as executor:
+        future_to_name = {
+            executor.submit(fn, *args): name for name, fn, args in tasks
+        }
+        for future in concurrent.futures.as_completed(future_to_name):
+            name = future_to_name[future]
+            try:
+                df = future.result()
+                if df is not None and not df.empty:
+                    all_frames.append(df)
+                    if name == "EVTX":         artifact_counts["evtx"]       = len(df)
+                    elif name == "SAM":        artifact_counts["sam"]        = len(df)
+                    elif name == "SOFTWARE":   artifact_counts["software"]   = len(df)
+                    elif name == "USB":        artifact_counts["usb"]        = len(df)
+                    elif name == "BROWSER":    artifact_counts["browser"]    = len(df)
+                    elif name == "COMMUNICATION": artifact_counts["comm"]    = len(df)
+                    elif name == "PREFETCH":   artifact_counts["prefetch"]   = len(df)
+                    elif name == "FILESYSTEM": artifact_counts["filesystem"] = len(df)
+                    print(f"  [OK] {name}: {len(df)} entries")
+                elif debug_extract:
+                    print(f"  [DEBUG] {name}: 0 entries")
+            except Exception as exc:
+                print(f"  [FAIL] {name} extraction failed: {exc}")
+                if debug_extract:
+                    traceback.print_exc()
+
+    if not all_frames:
+        raise RuntimeError(
+            f"[ERROR] No artifacts extracted from '{os.path.basename(primary_file)}'."
+        )
+
+    result = pd.concat(all_frames, ignore_index=True)
+    artifact_counts["total"] = len(result)
+    return result
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# SECTION 3: BEHAVIORAL ML ANOMALY DETECTION
+# SECTION 3: FEATURE ENGINEERING & ML
 # ═══════════════════════════════════════════════════════════════════════════
 
 def engineer_features(df):
-    """Add HourOfDay and EventsPerMinute columns to the DataFrame."""
-    # HourOfDay
     def extract_hour(dt_str):
         try:
             return pd.to_datetime(str(dt_str)).hour
@@ -1028,7 +1805,6 @@ def engineer_features(df):
 
     df['HourOfDay'] = df['Date and Time'].apply(extract_hour)
 
-    # EventsPerMinute — simplified for runtime performance
     df['_ts'] = pd.to_datetime(df['Date and Time'], errors='coerce')
     df = df.sort_values('_ts').reset_index(drop=True)
 
@@ -1049,17 +1825,14 @@ def engineer_features(df):
     df['EventsPerMinute'] = epm
     df.drop(columns=['_ts'], inplace=True, errors='ignore')
 
-    # ── VECTORIZED ML & HEURISTIC INFERENCE ──
     print("   Vectorizing behavioral threat predictions...")
-    
-    # Fast event ID extraction
+
     def extract_eid(eid_raw):
         val = ''.join(filter(str.isdigit, str(eid_raw)))
         return int(val) if val else 0
-        
+
     df['EventID_Num'] = df['Event ID'].apply(extract_eid)
 
-    # ML Inference (Predict all 30k+ rows at once)
     if ml_alarm is not None:
         try:
             features = df[['EventID_Num', 'HourOfDay', 'EventsPerMinute']].values
@@ -1070,7 +1843,6 @@ def engineer_features(df):
     else:
         df['ML_Prediction'] = 1
 
-    # Heuristic & Status Resolution
     def resolve_label(row):
         eid = row['EventID_Num']
         if eid in HEURISTIC_THREAT_IDS:
@@ -1079,33 +1851,50 @@ def engineer_features(df):
             return -1, "STATISTICAL ANOMALY (Behavioral)"
         return 1, "VERIFIED NORMAL"
 
-    # Apply resolution map
     statuses = df.apply(resolve_label, axis=1)
     df['AnomalyScore'] = [s[0] for s in statuses]
-    df['AnomalyLabel'] = [s[1].replace(" ", "").replace(" ", "").replace(" ", "") for s in statuses]
+    df['AnomalyLabel'] = [s[1] for s in statuses]
 
     return df
 
 
 def get_anomaly_status(row):
-    """
-    Classify a row using pre-computed vector labels for O(1) performance.
-    """
     score = row.get('AnomalyScore', 1)
     label = row.get('AnomalyLabel', "VERIFIED NORMAL")
     return score, label
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# SECTION 4: RAG PIPELINE (Retrieval-Augmented Generation)
+# SECTION 4: RAG / LLM
+# ═══════════════════════════════════════════════════════════════════════════
+
 faiss_lock = threading.Lock()
 
+# ── FIX-3: Normalize text before embedding to maximize cache hit rate ─────
+def _normalize_for_embedding(txt: str) -> str:
+    """Collapse volatile tokens so semantically identical events share one vector."""
+    txt = re.sub(r'\d{4}-\d{2}-\d{2}\s\d{2}:\d{2}:\d{2}(\s?UTC)?', '<TS>', txt)
+    txt = re.sub(r'\{[0-9A-Fa-f\-]{36}\}', '<GUID>', txt)
+    txt = re.sub(r'\b0x[0-9A-Fa-f]{4,}\b', '<HEX>', txt)
+    txt = re.sub(r'\b\d{6,}\b', '<NUM>', txt)
+    txt = re.sub(r'([A-Za-z]:\\|/)[^\s|]+[\\/]', '<PATH>/', txt)
+    return txt.strip()
+
 def build_rag_context(query, top_k=8):
-    """Retrieve top-k relevant evidence rows via FAISS and build LLM context."""
     global faiss_index, ai_model, image_hash_sha256
 
     if current_audit_df is None:
         return [], ""
+
+    # ── REQ-1 & REQ-2: Strict filtering — Activity-Based artifacts ONLY ──────
+    # FILESYSTEM (MFT) is completely excluded from FAISS embedding.
+    # File count questions are answered via extract_system_context() metadata.
+    EMBED_TYPES = {'EVTX', 'REGISTRY', 'SAM', 'SOFTWARE'}
+
+    embed_mask = current_audit_df['ArtifactType'].str.upper().isin(EMBED_TYPES)
+    embed_df = current_audit_df[embed_mask].copy().reset_index(drop=True)
+    embed_df = embed_df.drop_duplicates(subset=['Task Category']).reset_index(drop=True)
+    # ─────────────────────────────────────────────────────────────────────────
 
     from sentence_transformers import SentenceTransformer
 
@@ -1114,51 +1903,103 @@ def build_rag_context(query, top_k=8):
             ai_model = SentenceTransformer('all-MiniLM-L6-v2')
 
         if faiss_index is None:
-            cache_dir = os.path.join(SCRIPT_DIR, "cache", "faiss")
-            os.makedirs(cache_dir, exist_ok=True)
-            
             cache_file = None
             if image_hash_sha256:
-                cache_file = os.path.join(cache_dir, f"{image_hash_sha256}_v7_faiss.index")
-                
+                case_dir = os.path.join(SCRIPT_DIR, "cache", image_hash_sha256)
+                os.makedirs(case_dir, exist_ok=True)
+                cache_file = os.path.join(case_dir, "faiss.index")
+
+            # ── REQ-4: Validate cache against filtered embed_df, not full df ─
             if cache_file and os.path.exists(cache_file):
-                print("  [FAISS] Loading FAISS index directly from disk cache...")
-                faiss_index = faiss.read_index(cache_file)
-            else:
-                print("  [FAISS] Generating FAISS embeddings for ALL artifacts (optimized batching)...")
-                texts_series = current_audit_df['Task Category'].fillna('').astype(str)
+                print(f"  [FAISS] Loading cached index: {image_hash_sha256[:16]}...")
+                loaded_index = faiss.read_index(cache_file)
+                if loaded_index.ntotal == len(embed_df):
+                    faiss_index = loaded_index
+                    print(f"  [FAISS] Cache valid ({loaded_index.ntotal} vectors).")
+                else:
+                    print(
+                        f"  [WARN] Cache size mismatch "
+                        f"({loaded_index.ntotal} cached vs {len(embed_df)} filtered). "
+                        f"Rebuilding..."
+                    )
+                    faiss_index = None
+            # ─────────────────────────────────────────────────────────────────
+
+            if faiss_index is None:
+                print(f"  [FAISS] Vectorizing {len(embed_df)} activity artifacts "
+                      f"(EVTX + REGISTRY + SAM + SOFTWARE only)...")
+                t0 = time.time()
+
+                texts_series = embed_df['Task Category'].fillna('').astype(str)
                 unique_texts = texts_series.unique().tolist()
-                
-                # Reduce batch_size to 32 to prevent PyTorch CPU Out-Of-Memory errors
-                unique_embeddings = ai_model.encode(unique_texts, batch_size=32, show_progress_bar=False)
-                
-                # Map unique embeddings back to all rows
-                text_to_idx = {text: idx for idx, text in enumerate(unique_texts)}
-                indices = texts_series.map(text_to_idx).values
-                full_embeddings = unique_embeddings[indices]
-                
-                # Build FAISS index natively
+
+                # Normalize to collapse volatile tokens and improve cache hits
+                normalized_texts = [_normalize_for_embedding(t) for t in unique_texts]
+
+                # ── REQ: num_workers removed — not supported by this ST version ──
+                unique_embeddings = ai_model.encode(
+                    normalized_texts,
+                    batch_size=256,
+                    show_progress_bar=False,
+                    convert_to_numpy=True,
+                )
+                # ─────────────────────────────────────────────────────────────
+
+                # Map unique embeddings back to the full filtered series
+                text_to_idx = {text: i for i, text in enumerate(unique_texts)}
+                idx_map = texts_series.map(text_to_idx).values
+                full_embeddings = unique_embeddings[idx_map]
+
                 dim = full_embeddings.shape[1]
-                faiss_index = faiss.IndexFlatL2(dim)
+
+                # ── FIX-2: IVF only at large scale; Flat L2 for typical loads ─
+                ivf_threshold = int(os.getenv("FAISS_IVF_THRESHOLD", "500"))
+                n_unique = len(unique_embeddings)
+                if n_unique > ivf_threshold:
+                    nlist = min(int(n_unique ** 0.5), 256)
+                    quantizer = faiss.IndexFlatL2(dim)
+                    faiss_index = faiss.IndexIVFFlat(quantizer, dim, nlist)
+                    faiss_index.train(
+                        np.array(unique_embeddings).astype('float32')
+                    )
+                    faiss_index.nprobe = min(32, nlist)
+                    print(f"  [FAISS] Using IVF index (nlist={nlist})")
+                else:
+                    faiss_index = faiss.IndexFlatL2(dim)
+                    print(f"  [FAISS] Using Flat L2 index")
+                # ─────────────────────────────────────────────────────────────
+
                 faiss_index.add(np.array(full_embeddings).astype('float32'))
-                
-                # Serialize FAISS index directly to disk to eliminate memory overhead
+
                 if cache_file:
                     faiss.write_index(faiss_index, cache_file)
 
-    # Search
-    query_vec = ai_model.encode([query])
-    distances, indices = faiss_index.search(np.array(query_vec).astype('float32'), k=top_k)
+                elapsed = time.time() - t0
+                print(f"  [FAISS] Index ready — {faiss_index.ntotal} vectors "
+                      f"in {elapsed:.2f}s")
 
-    # Collect relevant rows
+    # Return early if this was just an init/warmup call
+    if query == "Init":
+        return [], ""
+
+    # ── REQ-5: embed_df is always defined above the lock so search is safe ───
+    # Encode query — num_workers omitted for ST compatibility
+    query_vec = ai_model.encode([query], convert_to_numpy=True)
+    distances, result_indices = faiss_index.search(
+        np.array(query_vec).astype('float32'), k=top_k
+    )
+
     relevant_rows = []
     context_lines = []
-    for idx_in_list, (dist, idx) in enumerate(zip(distances[0], indices[0])):
-        row = current_audit_df.iloc[idx]
+
+    for rank, (dist, idx) in enumerate(zip(distances[0], result_indices[0])):
+        if idx < 0 or idx >= len(embed_df):
+            continue
+        row = embed_df.iloc[idx]
         relevant_rows.append(row)
-        _, status = get_anomaly_status(row)
         context_lines.append(
-            f"[Evidence {idx_in_list}] Time: {row.get('Date and Time', 'N/A')} | "
+            f"[Evidence {rank}] "
+            f"Time: {row.get('Date and Time', 'N/A')} | "
             f"EventID: {row.get('Event ID', 'N/A')} | "
             f"Source: {row.get('LogSource', 'N/A')} | "
             f"Description: {row.get('Task Category', 'N/A')}"
@@ -1171,28 +2012,29 @@ def extract_system_context():
     global current_audit_df
     if current_audit_df is None or current_audit_df.empty:
         return "No evidence loaded."
-    
-    source_col = 'LogSource' if 'LogSource' in current_audit_df.columns else 'Source'
-    df = current_audit_df # Local reference
-    
-    # Efficiently group by ArtifactType
+
+    df = current_audit_df
+
+    start_time, end_time = "N/A", "N/A"
+    hostname, os_version = "Unknown", "Unknown"
+    user_list = "None"
+
     type_groups = {k: g for k, g in df.groupby(df['ArtifactType'].astype(str).str.upper())}
-    # Ensure all expected keys exist to avoid KeyErrors
     for t in ['SAM', 'REGISTRY', 'SOFTWARE', 'FILESYSTEM', 'PREFETCH', 'ACTIVITY']:
         if t not in type_groups:
             type_groups[t] = pd.DataFrame(columns=df.columns)
 
-    # 1. User Profiles (from Registry Task Category)
     users = set()
     all_categories = df['Task Category'].dropna().astype(str)
-    ntuser_entries = all_categories[all_categories.str.contains(r"NTUSER\(", case=False, na=False)]
+    ntuser_entries = all_categories[
+        all_categories.str.contains(r"NTUSER\(", case=False, na=False)
+    ]
     for desc_str in ntuser_entries.unique():
         match = re.search(r'NTUSER\((.*?)\)', desc_str, re.IGNORECASE)
         if match:
             users.add(match.group(1).strip())
     user_list = ", ".join(users) if users else "None found"
-    
-    # 2. SAM User Accounts
+
     sam_users = []
     sam_logon_stats = []
     for desc in type_groups['SAM']['Task Category'].dropna():
@@ -1204,20 +2046,17 @@ def extract_system_context():
             sam_users.append(u_name)
             if logon_match:
                 sam_logon_stats.append((u_name, int(logon_match.group(1))))
-    sam_users_str = f"{len(sam_users)} accounts: {', '.join(sam_users)}" if sam_users else "None found"
-    
-    
-    # 3. Deep System Profiling (Registry)
-    hostname, os_version = "Unknown", "Unknown"
+    sam_users_str = (f"{len(sam_users)} accounts: {', '.join(sam_users)}"
+                     if sam_users else "None found")
+
     usb_devices, run_keys = [], []
     av_disabled = False
 
-    # Use a single pass for Registry lookups
     reg_df = type_groups['REGISTRY']
     reg_descs = reg_df['Task Category'].dropna().astype(str)
     for desc in reg_descs:
         d_lower = desc.lower()
-        if "computername\\computername =" in d_lower:
+        if "computername\\computername" in d_lower and "=" in d_lower:
             hostname = desc.split("=")[-1].strip()
         elif "currentversion\\productname =" in d_lower:
             os_version = desc.split("=")[-1].strip()
@@ -1232,92 +2071,193 @@ def extract_system_context():
     for desc in sw_descs:
         if "OS Information:" in desc and os_version == "Unknown":
             match = re.search(r'ProductName:\s*([^|]+)', desc)
-            if match: os_version = match.group(1).strip()
+            if match:
+                os_version = match.group(1).strip()
 
-    usb_str = ", ".join(set([u for u in usb_devices if len(u) > 3][:5])) if usb_devices else "None detected"
-    run_str = ", ".join(set([r for r in run_keys if len(r) > 3][:5])) if run_keys else "None detected"
-    
-    # 4. File Extension Statistics
+    usb_str = ", ".join(set([u for u in usb_devices if len(u) > 3][:5])) if usb_devices else "None"
+    run_str = ", ".join(set([r for r in run_keys if len(r) > 3][:5])) if run_keys else "None"
+
     file_stats_str = "No filesystem data"
     fs_df = type_groups['FILESYSTEM']
     if not fs_df.empty and '_extension' in fs_df.columns:
         total_files = len(fs_df[fs_df['_is_dir'] == False])
         total_dirs = len(fs_df[fs_df['_is_dir'] == True])
         all_exts = fs_df[fs_df['_extension'].astype(str) != '']['_extension'].value_counts().head(20)
-        
         categories = {
-            "Images": [".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tiff", ".webp"],
-            "Videos": [".mp4", ".mov", ".avi", ".mkv", ".wmv"],
-            "Docs": [".pdf", ".doc", ".docx", ".txt", ".xlsx", ".csv", ".pptx", ".rtf"],
+            "Images":      [".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tiff", ".webp"],
+            "Videos":      [".mp4", ".mov", ".avi", ".mkv", ".wmv"],
+            "Docs":        [".pdf", ".doc", ".docx", ".txt", ".xlsx", ".csv", ".pptx", ".rtf"],
             "Executables": [".exe", ".dll", ".sys", ".bat", ".ps1", ".msi"],
-            "Archives": [".zip", ".rar", ".7z", ".tar", ".gz", ".iso"]
+            "Archives":    [".zip", ".rar", ".7z", ".tar", ".gz", ".iso"]
         }
-        cat_counts = {cat: sum([all_exts.get(e, 0) for e in elist]) for cat, elist in categories.items()}
+        cat_counts = {
+            cat: sum([all_exts.get(e, 0) for e in elist])
+            for cat, elist in categories.items()
+        }
         cat_parts = [f"{k}: {int(v)}" for k, v in cat_counts.items()]
         ext_parts = [f"{k}: {int(v)}" for k, v in all_exts.head(15).items()]
-        file_stats_str = f"Total Files: {total_files}, Total Dirs: {total_dirs}. CATEGORY COUNTS: {', '.join(cat_parts)}. DETAILED EXTENSIONS: {', '.join(ext_parts)}"
-    
-    # 5. Installed/Executed Programs
-    installed = [re.search(r'Installed Program:\s*(.+?)(?:\s*v|\s*\()', str(d)).group(1).strip() 
-                 for d in sw_descs if "Installed Program:" in str(d) and re.search(r'Installed Program:\s*(.+?)(\s*v|\s*\()', str(d))]
-    programs_str = f"{len(installed)} programs: {', '.join(installed[:10])}" if installed else "No program data"
-    
-    prefetch = [re.search(r'Prefetch:\s*(.+?)\s*\(', str(d)).group(1).strip() 
-                for d in type_groups['PREFETCH']['Task Category'].dropna() if "Prefetch:" in str(d)]
+        file_stats_str = (f"Total Files: {total_files}, Total Dirs: {total_dirs}. "
+                          f"CATEGORY COUNTS: {', '.join(cat_parts)}. "
+                          f"DETAILED EXTENSIONS: {', '.join(ext_parts)}")
+
+    installed = [
+        re.search(r'Installed Program:\s*(.+?)(?:\s*v|\s*\()', str(d)).group(1).strip()
+        for d in sw_descs
+        if "Installed Program:" in str(d)
+        and re.search(r'Installed Program:\s*(.+?)(\s*v|\s*\()', str(d))
+    ]
+    programs_str = (f"{len(installed)} programs: {', '.join(installed[:10])}"
+                    if installed else "No program data")
+
+    prefetch = [
+        re.search(r'Prefetch:\s*(.+?)\s*\(', str(d)).group(1).strip()
+        for d in type_groups['PREFETCH']['Task Category'].dropna()
+        if "Prefetch:" in str(d)
+    ]
     pf_unique = list(set(prefetch))
-    prefetch_str = f"{len(pf_unique)} unique programs: {', '.join(pf_unique[:10])}" if pf_unique else "No prefetch data"
-    
-    # 7. Time Range & Active Users
+    prefetch_str = (f"{len(pf_unique)} unique programs: {', '.join(pf_unique[:10])}"
+                    if pf_unique else "No prefetch data")
+
+    recent_programs_str = "None"
+    if not type_groups['PREFETCH'].empty:
+        pf_df = type_groups['PREFETCH'].copy()
+        pf_df['_ts'] = pd.to_datetime(pf_df['Date and Time'], errors='coerce')
+        pf_df = pf_df.sort_values('_ts', ascending=False)
+        pf_names = []
+        for d in pf_df['Task Category'].dropna().astype(str):
+            m = re.search(r'Prefetch:\s*(.+?)\s*\(', d)
+            if m:
+                pf_names.append(m.group(1).strip())
+        pf_names = [n for n in pf_names if n]
+        recent_programs_str = ", ".join(list(dict.fromkeys(pf_names))[:5]) if pf_names else "None"
+    elif not type_groups['ACTIVITY'].empty:
+        act_df = type_groups['ACTIVITY']
+        act_names = []
+        for d in act_df['Task Category'].dropna().astype(str):
+            m = re.search(r'opened\s+(.*?)\s*\(LNK', d, re.IGNORECASE)
+            if m:
+                act_names.append(m.group(1).strip())
+        recent_programs_str = (", ".join(list(dict.fromkeys(act_names))[:5])
+                               if act_names else "None")
+
     try:
         times = df['Date and Time'].dropna()
         start_time, end_time = times.min(), times.max()
     except:
         start_time, end_time = "Unknown", "Unknown"
-        
+
     logon_users = []
     logons_df = df[df['Event ID'].astype(str).isin(['4624', '4625', '4624.0', '4625.0'])]
     for desc in logons_df['Task Category'].dropna():
         match = re.search(r'(?:TargetUserName|SubjectUserName):\s*([^\s\|]+)', str(desc))
         if match:
             u = match.group(1).strip()
-            if u not in ['-', 'SYSTEM', 'NETWORK', 'LOCAL SERVICE', 'NETWORK SERVICE'] and not u.endswith('$'):
+            if u not in ['-', 'SYSTEM', 'NETWORK', 'LOCAL SERVICE', 'NETWORK SERVICE'] \
+                    and not u.endswith('$'):
                 logon_users.append(u)
-    
+
     unified_counts = {u: c for u, c in sam_logon_stats}
     for u, c in Counter(logon_users).items():
         unified_counts[u] = max(c, unified_counts.get(u, 0))
-    active_users_str = ", ".join([f"{u} ({c} logons)" for u, c in Counter(unified_counts).most_common(5)])
-    
-    # 9. Meta Stats
+    active_users_str = ", ".join(
+        [f"{u} ({c} logons)" for u, c in Counter(unified_counts).most_common(5)]
+    )
+
     top_events = df['Event ID'].value_counts().head(5).to_dict()
     top_events_str = ", ".join([f"ID {k} ({v})" for k, v in top_events.items()])
-    
+
     cleared_count = len(df[df['Event ID'].astype(str).isin(['1102', '1102.0'])])
-    alerts_str = (f"Audit Logs Cleared ({cleared_count}x), " if cleared_count else "") + ("AV DISABLED" if av_disabled else "None")
-    
-    anom_counts = df['AnomalyScore'].value_counts().to_dict() if 'AnomalyScore' in df.columns else {}
-    anomaly_str = f"Normal: {anom_counts.get(1,0)}, Threat: {anom_counts.get(-1,0)}"
-    
-    recent_docs = [str(d) for d in type_groups['ACTIVITY']['Task Category'].dropna().unique() if any(x in str(d).lower() for x in ['opened', 'interacted'])]
+    alerts_str = ((f"Audit Logs Cleared ({cleared_count}x), " if cleared_count else "")
+                  + ("AV DISABLED" if av_disabled else "None"))
+
+    anom_counts = (df['AnomalyScore'].value_counts().to_dict()
+                   if 'AnomalyScore' in df.columns else {})
+    anomaly_str = f"Normal: {anom_counts.get(1, 0)}, Threat: {anom_counts.get(-1, 0)}"
+
+    recent_docs = [
+        str(d) for d in type_groups['ACTIVITY']['Task Category'].dropna().unique()
+        if any(x in str(d).lower() for x in ['opened', 'interacted'])
+    ]
     recent_docs_str = "\n   - ".join(recent_docs[:10]) if recent_docs else "None"
 
+    usb_df = type_groups.get('USB', pd.DataFrame())
+    usb_count = len(usb_df)
+    usb_list = "None"
+    if not usb_df.empty and 'Task Category' in usb_df.columns:
+        extracted = (usb_df['Task Category'].str
+                     .extract(r'USB Device Attached: (.*?) \(')[0]
+                     .dropna().unique().tolist())
+        if not extracted:
+            extracted = (usb_df['Task Category'].str
+                         .extract(r'USB Device:\s*(.*?) \(')[0]
+                         .dropna().unique().tolist())
+        usb_list = ", ".join(extracted[:8]) if extracted else "None"
+
+    browser_df = type_groups.get('BROWSER', pd.DataFrame())
+    search_count = bookmark_count = cookie_count = 0
+    if not browser_df.empty and 'Event ID' in browser_df.columns:
+        search_count   = len(browser_df[browser_df['Event ID'].astype(str).isin(['9600', '9600.0'])])
+        bookmark_count = len(browser_df[browser_df['Event ID'].astype(str).isin(['9602', '9602.0'])])
+        cookie_count   = len(browser_df[browser_df['Event ID'].astype(str).isin(['9603', '9603.0'])])
+
+    recent_df = type_groups.get('RECENT', pd.DataFrame())
+    recent_count = len(recent_df)
+    if recent_count == 0:
+        activity_df = type_groups.get('ACTIVITY', pd.DataFrame())
+        recent_count = (
+            len(activity_df[activity_df['Task Category']
+                            .astype(str).str.contains('Recent Document', na=False)])
+            if not activity_df.empty else 0
+        )
+
+    recycle_df = type_groups.get('RECYCLE', pd.DataFrame())
+    recycle_count = len(recycle_df)
+
+    comm_df = type_groups.get('COMMUNICATION', pd.DataFrame())
+    comm_count = len(comm_df)
+
     return (
-        f"TOTAL LOGS: {len(df)}\nRANGE: {start_time} to {end_time}\n"
+        f"TOTAL LOGS: {len(df)}\nRANGE: {start_time} UTC to {end_time} UTC\n"
         f"HOST: {hostname} | OS: {os_version}\nALERTS: {alerts_str}\n"
         f"SAM USERS: {sam_users_str}\nPROFILES: {user_list}\n"
         f"ACTIVE USERS: {active_users_str}\nFILESYSTEM: {file_stats_str}\n"
         f"PROGRAMS: {programs_str}\nPREFETCH: {prefetch_str}\n"
+        f"RECENT PROGRAMS: {recent_programs_str}\n"
+        f"USB DEVICES ({usb_count}): {usb_list}\n"
+        f"WEB ACTIVITY: {search_count} searches, {bookmark_count} bookmarks, "
+        f"{cookie_count} cookies\n"
+        f"RECENT DOCUMENTS: {recent_count} entries showing recently accessed files\n"
+        f"RECYCLE BIN: {recycle_count} items currently in the recycle bin\n"
+        f"COMMUNICATION: {comm_count} email/mail files found\n"
         f"TOP EVENTS: {top_events_str}\nRECENT ACTIVITY: {recent_docs_str}\n"
         f"ANOMALIES: {anomaly_str}"
     )
 
 
+def format_evidence_block(evidence_context, max_lines=5):
+    if not evidence_context:
+        return ""
+    lines = [line.strip() for line in evidence_context.split("\n") if line.strip()]
+    lines = lines[:max_lines]
+    if not lines:
+        return ""
+    return "\n".join([f"- {line}" for line in lines])
+
+
+def build_offline_response(user_question, evidence_context):
+    system_facts = extract_system_context()
+    evidence_block = format_evidence_block(evidence_context)
+    if evidence_block:
+        evidence_block = f"\n\nEVIDENCE:\n{evidence_block}"
+    return (
+        "LLM unavailable. Returning deterministic summary.\n\n"
+        f"SYSTEM FACTS:\n{system_facts}"
+        f"{evidence_block}"
+    )
+
+
 def query_llm(user_question, evidence_context):
-    """Send the user question + evidence context to Gemini for forensic reasoning."""
     global cached_system_facts
-    
-    if gemini_client is None:
-        raise RuntimeError(" Gemini LLM is not configured. Set GEMINI_API_KEY in .env file.")
 
     if cached_system_facts is None:
         print("  [CACHE] Regenerating system facts...")
@@ -1325,36 +2265,20 @@ def query_llm(user_question, evidence_context):
 
     system_facts = cached_system_facts
 
-    system_prompt = f"""You are a Senior Digital Forensics Examiner with 20 years of experience in incident response.
+    system_prompt = f"""You are a Senior Digital Forensics Examiner.
 You are analyzing evidence extracted from a forensic disk image. Given the user's question, provide a clear, professional forensic analysis.
 
 ── GLOBAL SYSTEM FACTS (CRITICAL - READ FIRST) ──
 {system_facts}
 
 CRITICAL INSTRUCTIONS:
-1. If the user asks a general or aggregate question (e.g., "how many users", "how many PDF files", "what is the hostname", "what programs are installed", "who is the most active user"), you MUST answer using the GLOBAL SYSTEM FACTS provided above. These facts contain:
-   - USER ACCOUNTS FROM SAM: Actual Windows human user accounts. These are the ONLY real users.
-   - MOST ACTIVE LOGON USERS (EVTX): A list of accounts and their logon counts. NOTE: Accounts ending in '$' are machine accounts, NOT people. Ignore them when listing "users".
-   - FILE SYSTEM STATISTICS: Complete file counts by extension (pdf, exe, doc, jpg, etc.). Use this for ANY "how many files" or "what types of files" or "how many images" questions.
-   - RECENT DOCUMENT ACTIVITY: A summary of files recently opened or interacted with by users (LNK/JumpLists).
-   Do NOT tell the user to "investigate further"—you must state the facts directly using these numbers.
-   
-   IMPORTANT: If asked for "SYSTEM INFORMATION", only provide details like Hostname, OS Version, and User Accounts. 
-   If asked for "FILES" or "IMAGES" or "DOCUMENTS", use the FILE SYSTEM STATISTICS.
-   
-2. If the user asks about specific events or detailed analysis, use the RETRIEVED EVIDENCE below.
-3. State the forensic SIGNIFICANCE of your findings.
-4. What attack technique it might indicate (reference MITRE ATT&CK).
-5. A recommended NEXT STEP for the investigator.
-6. CITE YOUR SOURCES. At the very end of your response, on a new line, you MUST list the exact Evidence IDs you used from the RETRIEVED EVIDENCE. Format exactly as `USED_EVIDENCE: [0, 2]`. If you answered entirely using GLOBAL SYSTEM FACTS and none of the RETRIEVED EVIDENCE was relevant, you MUST output `USED_EVIDENCE: []`.
-
-7. **BOLD IMPORTANT TERMS**: Always **bold** key forensic findings, account names, timestamps, and suspicious activities.
-8. **TIMESTAMP COMPARISON**: If multiple timestamps are provided for the same type of event (e.g., last logon), you MUST compare them and explicitly state which one is the **latest** or **most recent**.
-9. **DIRECT ADDRESS**: Change your language to be more direct. Instead of "The next step for the investigator...", say "**The next step for you is to...**".
-10. **CONCISE SECTIONS**: Keep the "**Forensic Significance**" and "**Next Step**" sections brief and high-impact.
-
-Keep your response concise (under 300 words). Use professional forensic language.
-Format key findings in **bold**. Reference specific Event IDs and timestamps when available."""
+1. Use the GLOBAL SYSTEM FACTS for aggregate questions.
+2. Use the RETRIEVED EVIDENCE for detailed analysis.
+3. Provide a short evidence-backed answer with minimal narrative.
+4. Always bold key forensic findings, account names, timestamps, and suspicious activities.
+5. Include a short section "EVIDENCE" that lists 1-5 evidence lines verbatim.
+6. List evidence IDs as `USED_EVIDENCE: [id1, id2]`.
+7. Keep responses under 150 words."""
 
     prompt = f"""{system_prompt}
 
@@ -1366,946 +2290,223 @@ Format key findings in **bold**. Reference specific Event IDs and timestamps whe
 
 ── YOUR FORENSIC ANALYSIS ──"""
 
-    try:
-        # 1. Primary: Gemini (Modern SDK)
-        # We wrap this in a tighter timeout or check for common errors
-        response = gemini_client.models.generate_content(
-            model=GEMINI_MODEL_ID,
-            contents=user_question, # Using just the question for context if evidence is empty
-            config={
-                "system_instruction": system_prompt,
-                "temperature": 0.1
-            }
-        )
-        if evidence_context: # If we have evidence, use the full prompt
+    if groq_client:
+        try:
+            chat_completion = groq_client.chat.completions.create(
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": prompt}
+                ],
+                model="llama-3.3-70b-versatile",
+                temperature=0.2,
+            )
+            return chat_completion.choices[0].message.content
+        except Exception as e:
+            print(f"  [LLM] Groq error: {e}")
+
+    if gemini_client:
+        try:
             response = gemini_client.models.generate_content(
                 model=GEMINI_MODEL_ID,
                 contents=prompt,
-                config={
-                    "system_instruction": system_prompt,
-                    "temperature": 0.1
-                }
+                config={"system_instruction": system_prompt, "temperature": 0.1}
             )
-        return response.text
-    except Exception as e:
-        error_msg = str(e)
-        print(f"   [ERROR] Gemini API Failure: {error_msg}")
-        if groq_client:
-            print("   Gemini failed, falling back to Groq Llama-3...")
-            try:
-                # 2. Secondary: Groq
-                chat_completion = groq_client.chat.completions.create(
-                    messages=[
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": f"── RETRIEVED EVIDENCE ──\n{evidence_context}\n\n── INVESTIGATOR'S QUESTION ──\n{user_question}"}
-                    ],
-                    model="llama-3.3-70b-versatile",
-                    temperature=0.2,
-                )
-                return chat_completion.choices[0].message.content
-            except Exception as groq_e:
-                error_msg += f" | Groq failed: {str(groq_e)}"
-        
-        # 3. Ultimate Fallback: GPT4Free (Unlimited, No API Key Required)
-        try:
-            print("   Groq failed, falling back to G4F (Unlimited Free)...")
-            import g4f
-            g4f_response = g4f.ChatCompletion.create(
-                model=g4f.models.gpt_4o,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": f"── EVIDENCE ──\n{evidence_context}\n\n── QUESTION ──\n{user_question}"}
-                ],
-            )
-            return g4f_response
-        except Exception as g4f_e:
-            return f" CRITICAL LLM ERROR. All APIs (Gemini, Groq, G4F) are exhausted or failing.\nDetails: {error_msg} | G4F: {str(g4f_e)}"
+            return response.text
+        except Exception as e:
+            print(f"  [LLM] Gemini error: {e}")
+
+    return build_offline_response(user_question, evidence_context)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# SECTION 5: HTML FORMATTING (Evidence Cards)
+# SECTION 5: UPLOAD HANDLER & GUI
 # ═══════════════════════════════════════════════════════════════════════════
 
-def format_log_card(row, status_label, is_anomaly):
-    """Render an evidence card with forensic styling."""
-    if "HEURISTIC" in status_label:
-        border_color = "#FF4C4C"
-        badge_bg = "#FF4C4C"
-    elif "STATISTICAL" in status_label:
-        border_color = "#FFA500"
-        badge_bg = "#FFA500"
+def handle_image_upload(files):
+    global current_audit_df, image_hash_sha256, cached_system_facts, faiss_index
+
+    if not files:
+        return "No files uploaded."
+
+    filepaths = [f.name if hasattr(f, 'name') else str(f) for f in files]
+    primary_file = filepaths[0]
+    image_hash_sha256 = compute_sha256(primary_file)
+
+    case_dir = os.path.join(SCRIPT_DIR, "cache", image_hash_sha256)
+    os.makedirs(case_dir, exist_ok=True)
+    artifact_path = os.path.join(case_dir, "artifacts.pkl")
+
+    if os.path.exists(artifact_path):
+        current_audit_df = pd.read_pickle(artifact_path)
+        status_msg = (
+            f"Forensic Image Loaded: {len(current_audit_df)} artifacts recovered. "
+            f"SHA-256: {image_hash_sha256}"
+        )
     else:
-        border_color = "#2a5f7a"
-        badge_bg = "#5cb85c"
+        print(f"  [IMAGE] Analyzing new forensic source...")
+        df = carve_evidence_from_image(filepaths)
+        df = engineer_features(df)
+        df.to_pickle(artifact_path)
+        current_audit_df = df
+        status_msg = (
+            f"Forensic Image Carved: {len(df)} artifacts identified. "
+            f"SHA-256: {image_hash_sha256}"
+        )
 
-    artifact_type = row.get('ArtifactType', 'LOG')
-    artifact_icons = {
-        "REGISTRY": "", "EVTX": "", "FILESYSTEM": "",
-        "SAM": "", "SOFTWARE": "", "PREFETCH": ""
-    }
-    artifact_icon = artifact_icons.get(artifact_type, "")
+    # ── REQ-6: Always reset state and trigger background index build ─────────
+    # Applies to both fresh carves AND cache loads so repeated uploads work.
+    cached_system_facts = None
+    faiss_index = None  # Force index rebuild for new image
 
-    return f"""
-    <div style='background-color:#1e3f57; border-left:3px solid {border_color};
-                padding:12px 14px; margin-bottom:8px; border-radius:6px;
-                font-family: "Courier New", monospace;'>
-        <div style='display:flex; justify-content:space-between; align-items:center; margin-bottom:6px;'>
-            <span style='color:#8ab4cc; font-size:0.75em;'>📅 {row.get('Date and Time', 'N/A')}</span>
-            <div style='display:flex; gap:6px; align-items:center;'>
-                <span style='color:#456882; background:#132d3f; padding:2px 8px;
-                             border-radius:8px; font-size:0.6em;'>{artifact_icon} {artifact_type}</span>
-                <span style='color:#fff; background:{badge_bg}; padding:2px 10px;
-                             border-radius:10px; font-size:0.65em; font-weight:bold;
-                             letter-spacing:0.5px;'>{status_label}</span>
-            </div>
-        </div>
-        <p style='color:#d2e8f5; margin:4px 0 6px 0; font-size:0.88em; line-height:1.4;'>
-            {row.get('Task Category', 'N/A')}
-        </p>
-        <div style='display:flex; gap:16px;'>
-            <small style='color:#5a8a9f;'>🔑 ID: <b style='color:#8ab4cc;'>{row.get('Event ID', 'N/A')}</b></small>
-            <small style='color:#5a8a9f;'> Source: <b style='color:#8ab4cc;'>{row.get('LogSource', row.get('Source', 'N/A'))}</b></small>
-        </div>
-    </div>
-    """
-
-
-def format_llm_card(explanation):
-    """Render an LLM explanation card with distinctive forensic styling."""
-    if explanation is None:
-        return ""
-
-    # Convert markdown bold to HTML
-    formatted = explanation.replace("**", "<b>").replace("**", "</b>")
-    # Simple markdown bold parsing
-    import re as _re
-    formatted = _re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', explanation)
-    formatted = formatted.replace('\n', '<br>')
-
-    return f"""
-    <div style='background: linear-gradient(135deg, #1a1a3e, #2d1b4e);
-                border-left: 3px solid #8b5cf6;
-                padding: 16px 18px; margin: 12px 0; border-radius: 8px;
-                font-family: "Courier New", monospace;
-                border: 1px solid #4c1d95;'>
-        <div style='display:flex; align-items:center; gap:8px; margin-bottom:10px;'>
-            <span style='font-size:1.1em;'></span>
-            <span style='color:#c4b5fd; font-size:0.78em; letter-spacing:2px; font-weight:bold;'>
-                LLM FORENSIC ANALYSIS
-            </span>
-            <span style='color:#7c3aed; font-size:0.6em; background:#1a1a3e; padding:2px 8px;
-                         border-radius:8px; border:1px solid #4c1d95;'>GEMINI</span>
-        </div>
-        <div style='color:#e2d9f3; font-size:0.85em; line-height:1.6;'>
-            {formatted}
-        </div>
-    </div>
-    """
-
-
-def wrap_scroll_box(inner_html, title="Results", count=None):
-    count_badge = (
-        f"<span style='background:#456882; color:#d2e8f5; padding:2px 10px; "
-        f"border-radius:10px; font-size:0.75em; margin-left:10px;'>{count} entries</span>"
-        if count is not None else ""
-    )
-    return f"""
-    <div style='font-family:"Courier New", monospace;'>
-        <div style='color:#8ab4cc; font-size:0.8em; margin-bottom:8px; letter-spacing:1px;'>
-             {title.upper()} {count_badge}
-        </div>
-        <div style='max-height:520px; overflow-y:auto; padding-right:4px;
-                    scrollbar-width:thin; scrollbar-color:#456882 #132d3f;'>
-            {inner_html}
-        </div>
-    </div>
-    """
-
-
-def no_results_box(message, hint=""):
-    return f"""
-    <div style='color:#8ab4cc; font-family:monospace; padding:16px; background:#1e3f57;
-                border-radius:6px; border:1px solid #2a5f7a;'>
-         {message}<br>
-        {f"<span style='color:#5a8a9f; font-size:0.8em;'>{hint}</span>" if hint else ""}
-    </div>"""
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# SECTION 6: QUERY HANDLERS
-# ═══════════════════════════════════════════════════════════════════════════
-
-def parse_time_range(q):
-    # Match ranges: "13:00 to 14:00"
-    pattern = r'(\d{1,2}:\d{2})\s*(?:and|to|-)\s*(\d{1,2}:\d{2})'
-    match = re.search(pattern, q)
-    if match:
-        return match.group(1).zfill(5), match.group(2).zfill(5)
-    
-    # Match single times: "at 3 am", "at 3:00", "around 15:00", "at 15"
-    single_pattern = r'(?:at|around)\s*(\d{1,2})(?::00)?\s*(am|pm)?'
-    match2 = re.search(single_pattern, q)
-    if match2:
-        hour = int(match2.group(1))
-        meridian = match2.group(2)
-        if meridian == 'pm' and hour < 12: hour += 12
-        if meridian == 'am' and hour == 12: hour = 0
-        start_t = f"{hour:02d}:00"
-        end_t = f"{hour:02d}:59"
-        return start_t, end_t
-        
-    return None, None
-
-
-def filter_by_time(df, start_str, end_str):
-    def in_range(dt_val):
+    def _background_index_build():
         try:
-            time_part = str(dt_val).strip().split(" ")[-1][:5]
-            return start_str <= time_part <= end_str
-        except Exception:
-            return False
-    return df[df['Date and Time'].apply(in_range)]
+            print("  [FAISS] Background index build started...")
+            build_rag_context("Init")
+            print("  [FAISS] Background index build complete.")
+        except Exception as e:
+            print(f"  [FAISS] Background index build failed: {e}")
+            if debug_extract:
+                traceback.print_exc()
 
+    threading.Thread(target=_background_index_build, daemon=True).start()
+    # ─────────────────────────────────────────────────────────────────────────
 
-def detect_source_filter(q):
-    if any(k in q for k in ["security log", "security logs", "security events", "sec log"]):
-        return "SECURITY"
-    if any(k in q for k in ["application log", "application logs", "app log", "app logs"]):
-        return "APPLICATION"
-    if any(k in q for k in ["system log", "system logs", "sys log", "sys logs"]):
-        return "SYSTEM"
-    if any(k in q for k in ["registry", "reg key", "reg keys", "hive", "ntuser"]):
-        return "REGISTRY"
-    if any(k in q for k in ["file system", "filesystem", "files", "directories", "folders"]):
-        return "FILESYSTEM"
-    if any(k in q for k in ["prefetch", "executed program", "run program"]):
-        return "PREFETCH"
-    if any(k in q for k in ["installed program", "installed software", "installed app"]):
-        return "SOFTWARE"
-    if any(k in q for k in ["user account", "sam user", "sam hive"]):
-        return "SAM"
-    return None
+    return status_msg
 
+def build_gui():
+    CSS = """
+    .sidebar-box { background: #1e293b; padding: 20px; border-radius: 12px; border: 1px solid #334155; }
+    #chat-history { height: 500px; overflow-y: auto; background: #0f172a; border-radius: 8px; border: 1px solid #1e293b; }
+    .stat-card { background: #1e293b; border: 1px solid #334155; padding: 15px; border-radius: 8px; margin: 5px; text-align: center; }
+    #raw-artifacts { height: 520px; overflow: auto; }
+    """
 
-def is_show_all_query(q):
-    triggers = [
-        "all log", "all entries", "show log", "show logs",
-        "display log", "display logs", "list log", "list logs",
-        "view log", "view logs", "all events", "show events",
-        "show all", "list all", "display all"
-    ]
-    if q.strip() in ["logs", "log", "entries", "events"]:
-        return True
-    return any(t in q for t in triggers)
+    with gr.Blocks() as demo:
+        gr.Markdown("## 🛡️ VIGILANCE FORENSIC ENGINE v3.1")
 
+        with gr.Row():
+            with gr.Column(scale=1, elem_classes="sidebar-box"):
+                gr.Markdown("### 📂 Case Management")
+                image_input = gr.File(label="Upload Forensic Image", file_count="multiple")
+                upload_btn = gr.Button("🚀 CARVE ARTIFACTS", variant="primary")
+                status_box = gr.Textbox(label="FORENSIC STATUS", value="Standby", interactive=False)
 
-def ask_chatbot(query):
-    """Main query handler — routes to summary, anomalies, filters, or RAG pipeline."""
-    global current_audit_df, uploaded_embeddings, ai_model
+                gr.Markdown("---")
+                gr.Markdown("### 💡 Forensic Inquiry Examples")
+                gr.HTML("<div style='color:#94a3b8; font-size:0.85em;'>"
+                        "• 'List all user accounts'<br>"
+                        "• 'Show USB device history'<br>"
+                        "• 'Find deleted items'</div>")
 
-    if current_audit_df is None:
-        return """
-        <div style='background:#2a1a1a; border:1px solid #FF4C4C; padding:16px;
-                    border-radius:8px; color:#FF4C4C; font-family:"Courier New",monospace;'>
-             No evidence loaded. Upload a forensic image (.dd / .E01) or click "Load Demo Data" first.
-        </div>"""
+            with gr.Column(scale=3):
+                with gr.Tabs():
 
-    q = query.lower().strip()
+                    with gr.Tab("AI Investigation"):
+                        chatbot = gr.Chatbot(
+                            label="Forensic Reasoning Logs",
+                            height=500,
+                            elem_id="chat-history"
+                        )
+                        with gr.Row():
+                            msg = gr.Textbox(
+                                placeholder="Enter forensic query...",
+                                scale=9, container=False, show_label=False
+                            )
+                            submit_btn = gr.Button("Send", scale=1, variant="primary")
 
-    # ── BLOCK 1: SUMMARY ──
-    if "summar" in q:
-        heuristic_threats = []
-        statistical_anomalies = []
-        normal_count = 0
+                    with gr.Tab("Dashboard & Summary"):
+                        refresh_btn = gr.Button("🔄 REFRESH CASE SUMMARY", variant="primary")
+                        summary_output = gr.HTML(
+                            value="<div style='text-align:center; padding:50px; color:#94a3b8;'>"
+                                  "Upload a Case Image to generate summary.</div>"
+                        )
 
-        for _, r in current_audit_df.iterrows():
-            pred, label = get_anomaly_status(r)
-            if "HEURISTIC" in label:
-                heuristic_threats.append(r)
-            elif "STATISTICAL" in label:
-                statistical_anomalies.append(r)
-            else:
-                normal_count += 1
+                    with gr.Tab("Raw Artifacts"):
+                        artifacts_btn = gr.Button("Load Artifacts Dataframe")
+                        raw_dataframe = gr.Dataframe(
+                            interactive=False, wrap=True, elem_id="raw-artifacts"
+                        )
 
-        total_threats = len(heuristic_threats) + len(statistical_anomalies)
-        status_txt = "COMPROMISE LIKELY" if total_threats > 0 else "SYSTEM SECURE"
-        status_color = "#FF4C4C" if total_threats > 0 else "#5cb85c"
-        evtx_n = artifact_counts.get('evtx', 0)
-        reg_n = artifact_counts.get('registry', 0)
+        def respond(message, history):
+                # ── FIX-5: Guard against querying before background build completes ──
+            if faiss_index is None and current_audit_df is not None:
+                not_ready_msg = (
+                    "⏳ The forensic index is still being built in the background. "
+                    "Please wait 15–30 seconds and try again."
+                )
+                history = history or []
+                history.append({"role": "user", "content": message})
+                history.append({"role": "assistant", "content": not_ready_msg})
+                return "", history
+            # ─────────────────────────────────────────────────────────────────────
+            clean_history = []
+            for item in history:
+                if isinstance(item, (list, tuple)):
+                    clean_history.append({"role": "user", "content": str(item[0])})
+                    clean_history.append({"role": "assistant", "content": str(item[1])})
+                else:
+                    clean_history.append(item)
 
-        return f"""
-        <div style='background:#1e3f57; padding:20px; border-radius:10px;
-                    border:1px solid #456882; font-family:"Courier New",monospace;'>
-            <h2 style='color:#d2e8f5; margin-top:0; letter-spacing:1px; font-size:1.1em;'>
-                STATISTICAL INTELLIGENCE REPORT
-            </h2>
-            <hr style='border:0.5px solid #2a5f7a; margin:12px 0;'>
+            relevant_rows, context_text = build_rag_context(message)
+            bot_message = query_llm(message, context_text)
+            evidence_block = format_evidence_block(context_text)
+            if evidence_block and "EVIDENCE:" not in bot_message:
+                bot_message = f"{bot_message}\n\nEVIDENCE:\n{evidence_block}"
 
-            <div style='display:grid; grid-template-columns:1fr 1fr 1fr; gap:10px; margin-bottom:14px;'>
-                <div style='background:#132d3f; padding:12px; border-radius:6px;'>
-                    <div style='color:#5a8a9f; font-size:0.7em; margin-bottom:4px;'>TOTAL EVIDENCE</div>
-                    <div style='color:#d2e8f5; font-size:1.4em; font-weight:bold;'>{len(current_audit_df)}</div>
+            clean_history.append({"role": "user", "content": message})
+            clean_history.append({"role": "assistant", "content": bot_message})
+
+            return "", clean_history
+
+        def get_styled_summary():
+            if current_audit_df is None:
+                return ("<div style='color:#94a3b8;text-align:center;'>"
+                        "Upload a Case to begin summary analysis.</div>")
+            raw = extract_system_context()
+
+            try:
+                host = raw.split("HOST: ")[1].split(" | ")[0]
+                os_ver = raw.split("OS: ")[1].split("\n")[0]
+                total_logs = raw.split("TOTAL LOGS: ")[1].split("\n")[0]
+            except:
+                host, os_ver, total_logs = "Unknown Host", "Unknown OS", "0"
+
+            html = f"""
+            <div style='display: grid; grid-template-columns: repeat(3, 1fr);
+                        gap: 15px; margin-bottom: 20px;'>
+                <div class='stat-card'>
+                    <h4 style='color:#3b82f6;margin:0;'>HOST</h4>
+                    <p style='margin:5px 0;'>{host}</p>
                 </div>
-                <div style='background:#132d3f; padding:12px; border-radius:6px;'>
-                    <div style='color:#5a8a9f; font-size:0.7em; margin-bottom:4px;'> EVENT LOGS</div>
-                    <div style='color:#d2e8f5; font-size:1.4em; font-weight:bold;'>{evtx_n}</div>
+                <div class='stat-card'>
+                    <h4 style='color:#3b82f6;margin:0;'>OS</h4>
+                    <p style='margin:5px 0;'>{os_ver}</p>
                 </div>
-                <div style='background:#132d3f; padding:12px; border-radius:6px;'>
-                    <div style='color:#5a8a9f; font-size:0.7em; margin-bottom:4px;'> REGISTRY KEYS</div>
-                    <div style='color:#d2e8f5; font-size:1.4em; font-weight:bold;'>{reg_n}</div>
+                <div class='stat-card'>
+                    <h4 style='color:#3b82f6;margin:0;'>ARTIFACTS</h4>
+                    <p style='margin:5px 0;'>{total_logs}</p>
                 </div>
             </div>
-
-            <div style='display:grid; grid-template-columns:1fr 1fr 1fr; gap:10px; margin-bottom:14px;'>
-                <div style='background:#132d3f; padding:12px; border-radius:6px;'>
-                    <div style='color:#5a8a9f; font-size:0.7em; margin-bottom:4px;'> HEURISTIC THREATS</div>
-                    <div style='color:#FF4C4C; font-size:1.4em; font-weight:bold;'>{len(heuristic_threats)}</div>
-                </div>
-                <div style='background:#132d3f; padding:12px; border-radius:6px;'>
-                    <div style='color:#5a8a9f; font-size:0.7em; margin-bottom:4px;'> STATISTICAL ANOMALIES</div>
-                    <div style='color:#FFA500; font-size:1.4em; font-weight:bold;'>{len(statistical_anomalies)}</div>
-                </div>
-                <div style='background:#132d3f; padding:12px; border-radius:6px;'>
-                    <div style='color:#5a8a9f; font-size:0.7em; margin-bottom:4px;'> NORMAL</div>
-                    <div style='color:#5cb85c; font-size:1.4em; font-weight:bold;'>{normal_count}</div>
-                </div>
-            </div>
-
-            <hr style='border:0.5px solid #2a5f7a; margin:12px 0;'>
-            <p style='color:{status_color}; font-weight:bold; font-size:1.05em; margin:0;'>{status_txt}</p>
-        </div>"""
-
-    # ── BLOCK 2: ANOMALIES ──
-    if "anomal" in q or "critic" in q or "threat" in q:
-        cards = ""
-        count = 0
-        for _, row in current_audit_df.iterrows():
-            pred, label = get_anomaly_status(row)
-            if pred == -1:
-                cards += format_log_card(row, label, True)
-                count += 1
-        if not cards:
-            return no_results_box("No anomalies detected in evidence.", "The system appears clean.")
-        return wrap_scroll_box(cards, title="Anomaly Report", count=count)
-
-    # ── BLOCK 3: TIME RANGE ──
-    start_t, end_t = parse_time_range(q)
-    if start_t and end_t:
-        filtered_df = filter_by_time(current_audit_df, start_t, end_t)
-        source_kw = detect_source_filter(q)
-        if source_kw and not filtered_df.empty:
-            src_col = 'LogSource' if 'LogSource' in filtered_df.columns else 'Source'
-            filtered_df = filtered_df[
-                filtered_df[src_col].str.upper().str.contains(source_kw, na=False)
-            ]
-        if filtered_df.empty:
-            return no_results_box(
-                f"No evidence found between <b>{start_t}</b> and <b>{end_t}</b>" +
-                (f" in <b>{source_kw}</b> source" if source_kw else "") + ".",
-                "Try a wider time window."
-            )
-        cards = ""
-        for _, row in filtered_df.iterrows():
-            pred, label = get_anomaly_status(row)
-            cards += format_log_card(row, label, pred == -1)
-        title = f"Evidence {start_t} → {end_t}" + (f" · {source_kw}" if source_kw else "")
-        return wrap_scroll_box(cards, title=title, count=len(filtered_df))
-
-    # ── BLOCK 4: SOURCE FILTER ──
-    source_kw = detect_source_filter(q)
-    if source_kw and len(q.split()) <= 3 and "?" not in q:
-        src_col = 'LogSource' if 'LogSource' in current_audit_df.columns else 'Source'
-        filtered_df = current_audit_df[
-            current_audit_df[src_col].str.upper().str.contains(source_kw, na=False)
-        ]
-        if filtered_df.empty:
-            return no_results_box(f"No <b>{source_kw}</b> evidence found.", "Check the artifact types.")
-        cards = ""
-        for _, row in filtered_df.iterrows():
-            pred, label = get_anomaly_status(row)
-            cards += format_log_card(row, label, pred == -1)
-        return wrap_scroll_box(cards, title=f"{source_kw} Evidence Stream", count=len(filtered_df))
-
-    # ── BLOCK 5: SHOW ALL ──
-    if is_show_all_query(q):
-        cards = ""
-        for _, row in current_audit_df.iterrows():
-            pred, label = get_anomaly_status(row)
-            cards += format_log_card(row, label, pred == -1)
-        cards += "<div style='color:#5a8a9f; font-size:0.75em; padding:8px; text-align:center;'>── End of evidence stream ──</div>"
-        return wrap_scroll_box(cards, title="Full Evidence Stream", count=len(current_audit_df))
-
-    # ── BLOCK 6: RAG — SEMANTIC SEARCH + LLM REASONING ──
-    relevant_rows, context_text = build_rag_context(query)
-
-    # Get LLM explanation
-    if context_text:
-        explanation = query_llm(query, context_text)
-        
-        # Parse the used evidence IDs from the LLM response
-        used_ids = []
-        match = re.search(r'USED_EVIDENCE:\s*\[(.*?)\]', explanation)
-        if match:
-            id_strs = match.group(1).split(',')
-            for id_str in id_strs:
-                if id_str.strip().isdigit():
-                    used_ids.append(int(id_str.strip()))
-            
-            # Remove the citation tag from the display text
-            explanation = re.sub(r'USED_EVIDENCE:\s*\[.*?\]', '', explanation).strip()
-            
-        cards = format_llm_card(explanation)
-        
-        # ONLY render the log cards that the LLM explicitly deemed relevant!
-        rendered_count = 0
-        for i, row in enumerate(relevant_rows):
-            if i in used_ids:
-                pred, label = get_anomaly_status(row)
-                cards += format_log_card(row, label, pred == -1)
-                rendered_count += 1
-                
-        if rendered_count == 0:
-            system_facts_card = f"""
-            <div style='background: rgba(30, 64, 175, 0.15); border-left: 3px solid #3b82f6; padding: 16px; margin: 16px 0; border-radius: 6px; font-family: Inter, sans-serif; color: #94a3b8; font-size: 0.88em;'>
-                <div style='display:flex; align-items:center; gap:8px; margin-bottom:6px; color:#60a5fa; font-weight:600;'>
-                    <span>INFO:</span>
-                    <span>EVIDENCE SOURCE: GLOBAL SYSTEM FACTS</span>
-                </div>
-                <div style='line-height:1.5;'>
-                    The AI answered this query by aggregating parsed forensic metadata rather than specific event logs. Evidence was extracted from:
-                    <ul style='margin: 8px 0 0 20px; color:#cbd5e1;'>
-                        <li><b>SAM Registry Hive:</b> User Account Info & Logons</li>
-                        <li><b>SOFTWARE Registry Hive:</b> Installed Programs</li>
-                        <li><b>MFT / Filesystem:</b> File & Extension Statistics</li>
-                        <li><b>Prefetch:</b> Historical Executed Programs</li>
-                    </ul>
-                </div>
+            <div style='background:#0f172a; padding:20px; border-radius:8px;
+                        border:1px solid #1e293b; color:#cbd5e1; font-family:monospace;
+                        font-size:0.9em; height:450px; overflow-y:auto;'>
+                {raw.replace(chr(10), '<br>')}
             </div>
             """
-            cards += system_facts_card
-                
-        count_display = f"{rendered_count} logs cited" if rendered_count > 0 else "from system facts"
-        
-        # LOG TO SESSION FOR REPORTING
-        session_log.append({
-            "query": query,
-            "answer": explanation,
-            "evidence_ids": used_ids
-        })
-        
-        return wrap_scroll_box(cards, title=f'RAG Analysis → "{query}"', count=count_display)
+            return html
 
-    return wrap_scroll_box(cards, title=f'RAG Analysis → "{query}"', count=len(relevant_rows))
+        upload_btn.click(handle_image_upload, inputs=[image_input], outputs=[status_box])
+        msg.submit(respond, [msg, chatbot], [msg, chatbot], show_progress="hidden")
+        submit_btn.click(respond, [msg, chatbot], [msg, chatbot], show_progress="hidden")
+        refresh_btn.click(get_styled_summary, outputs=summary_output)
+        artifacts_btn.click(
+            lambda: current_audit_df if current_audit_df is not None else pd.DataFrame(),
+            outputs=raw_dataframe
+        )
+
+    return demo, CSS
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# SECTION 7: UPLOAD HANDLERS
-# ═══════════════════════════════════════════════════════════════════════════
-
-def handle_image_upload(file):
-    """Handle forensic image upload: hash it, carve evidence, engineer features."""
-    global current_audit_df, faiss_index, image_hash_sha256, cached_system_facts
-
-    faiss_index = None  # Reset embeddings cache
-    cached_system_facts = None  # Reset facts cache
-
-    if file is None:
-        return "Awaiting forensic image upload..."
-
-    filepath = file.name
-
-    # Step 1: SHA-256 hash for forensic soundness
-    print(f"\n  [HASH] Computing SHA-256 of {os.path.basename(filepath)}...")
-    image_hash_sha256 = compute_sha256(filepath)
-    print(f"  [HASH] SHA-256: {image_hash_sha256}")
-
-    # Step 2: Check for Cached Evidence DataFrame
-    cache_dir = os.path.join(SCRIPT_DIR, "cache", "data")
-    df_cache_path = os.path.join(cache_dir, f"{image_hash_sha256}_v7_df.pkl")
-    
-    if os.path.exists(df_cache_path):
-        print("  [CACHE] Cache Hit! Loading carved evidence DataFrame directly from disk...")
-        try:
-            df = pd.read_pickle(df_cache_path)
-            
-            # Safely count artifacts
-            if 'ArtifactType' in df.columns:
-                atype = df['ArtifactType'].fillna('').astype(str).str.upper()
-                artifact_counts['evtx'] = len(df[atype == 'EVTX'])
-                artifact_counts['registry'] = len(df[atype == 'REGISTRY'])
-                artifact_counts['filesystem'] = len(df[atype == 'FILESYSTEM'])
-                artifact_counts['sam'] = len(df[atype == 'SAM'])
-                artifact_counts['software'] = len(df[atype == 'SOFTWARE'])
-                artifact_counts['prefetch'] = len(df[atype == 'PREFETCH'])
-            else:
-                artifact_counts['evtx'] = len(df)
-            artifact_counts['total'] = len(df)
-        except Exception as e:
-            return f"[ERROR] Cache Load Failed: {str(e)}"
-    else:
-        # Step 3: Carve evidence from the image
-        print("  [CARVE] Carving evidence from disk image...")
-        try:
-            df = carve_evidence_from_image(filepath)
-        except Exception as e:
-            return f"[ERROR] Upload Failed: {str(e)}"
-
-        if df.empty:
-            return "[ERROR] No evidence could be extracted from the image."
-
-        # Step 4: Engineer behavioral features
-        print("  [ML] Engineering behavioral features...")
-        try:
-            df = engineer_features(df)
-        except Exception as e:
-            return f"[ERROR] Feature Engineering Failed: {str(e)}"
-            
-        # Save to Cache for next time
-        try:
-            os.makedirs(cache_dir, exist_ok=True)
-            df.to_pickle(df_cache_path)
-        except Exception as e:
-            print(f"  [WARN] Could not save DataFrame cache: {e}")
-
-    current_audit_df = df
-
-    evtx_n = artifact_counts.get('evtx', 0)
-    reg_n = artifact_counts.get('registry', 0)
-    fs_n = artifact_counts.get('filesystem', 0)
-    sam_n = artifact_counts.get('sam', 0)
-    sw_n = artifact_counts.get('software', 0)
-    pf_n = artifact_counts.get('prefetch', 0)
-
-    # Pre-compute FAISS embeddings in the background
-    def precompute_faiss():
-        try:
-            build_rag_context("")
-            print("  [OK] FAISS Embeddings loaded in background!")
-        except Exception as e:
-            print(f"  [ERROR] FAISS background generation failed: {e}")
-            traceback.print_exc()
-    threading.Thread(target=precompute_faiss).start()
-
-    return (
-        f"READY — {len(df)} evidence artifacts loaded.\n"
-        f"   EVTX: {evtx_n}  |  Registry: {reg_n}  |  Files: {fs_n}\n"
-        f"   SAM: {sam_n}  |  Software: {sw_n}  |  Prefetch: {pf_n}\n"
-        f"   [HASH] SHA-256: {image_hash_sha256}"
-    )
-
-
-
-
-def get_investigation_summary():
-    """Generate the Investigation Summary tab content."""
-    if current_audit_df is None:
-        return """
-        <div style='color:#5a8a9f; font-family:"Courier New",monospace; padding:40px; text-align:center;'>
-             Upload a forensic image to generate the investigation summary.
-        </div>"""
-
-    hash_display = image_hash_sha256 if image_hash_sha256 else "N/A"
-    evtx_n = artifact_counts.get('evtx', 0)
-    reg_n = artifact_counts.get('registry', 0)
-    fs_n = artifact_counts.get('filesystem', 0)
-    sam_n = artifact_counts.get('sam', 0)
-    sw_n = artifact_counts.get('software', 0)
-    pf_n = artifact_counts.get('prefetch', 0)
-    total_n = artifact_counts.get('total', len(current_audit_df))
-
-    # Count anomalies
-    heuristic_count = 0
-    statistical_count = 0
-    for _, row in current_audit_df.iterrows():
-        _, label = get_anomaly_status(row)
-        if "HEURISTIC" in label:
-            heuristic_count += 1
-        elif "STATISTICAL" in label:
-            statistical_count += 1
-
-    timestamp_now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-
-    return f"""
-    <div style='font-family:"Courier New",monospace; padding:10px;'>
-
-        <!-- Header -->
-        <div style='background:linear-gradient(135deg, #1a3a5c, #1e3f57);
-                    padding:20px; border-radius:10px; border:1px solid #456882; margin-bottom:16px;'>
-            <h2 style='color:#d2e8f5; margin:0 0 8px 0; letter-spacing:1px; font-size:1.1em;'>
-                 INVESTIGATION SUMMARY
-            </h2>
-            <div style='color:#5a8a9f; font-size:0.72em;'>Generated: {timestamp_now}</div>
-        </div>
-
-        <!-- SHA-256 Hash -->
-        <div style='background:#132d3f; padding:16px; border-radius:8px; border:1px solid #2a5f7a;
-                    margin-bottom:12px;'>
-            <div style='color:#5a8a9f; font-size:0.7em; letter-spacing:2px; margin-bottom:8px;'>
-                 FORENSIC IMAGE HASH (SHA-256)
-            </div>
-            <div style='color:#5cb85c; font-size:0.9em; word-break:break-all; white-space:pre-wrap; background:#0f2535;
-                        padding:12px; border-radius:4px; border:1px solid #1e3f57;'>
-                {hash_display}
-            </div>
-        </div>
-
-        <!-- Artifact Counts -->
-        <div style='display:grid; grid-template-columns:1fr 1fr 1fr; gap:10px; margin-bottom:12px;'>
-            <div style='background:#132d3f; padding:16px; border-radius:8px; text-align:center;
-                        border:1px solid #2a5f7a;'>
-                <div style='color:#5a8a9f; font-size:0.68em; margin-bottom:6px;'> EVENT LOGS</div>
-                <div style='color:#d2e8f5; font-size:1.8em; font-weight:bold;'>{evtx_n}</div>
-            </div>
-            <div style='background:#132d3f; padding:16px; border-radius:8px; text-align:center;
-                        border:1px solid #2a5f7a;'>
-                <div style='color:#5a8a9f; font-size:0.68em; margin-bottom:6px;'> REGISTRY KEYS</div>
-                <div style='color:#d2e8f5; font-size:1.8em; font-weight:bold;'>{reg_n}</div>
-            </div>
-            <div style='background:#132d3f; padding:16px; border-radius:8px; text-align:center;
-                        border:1px solid #2a5f7a;'>
-                <div style='color:#5a8a9f; font-size:0.68em; margin-bottom:6px;'> TOTAL ARTIFACTS</div>
-                <div style='color:#d2e8f5; font-size:1.8em; font-weight:bold;'>{total_n}</div>
-            </div>
-        </div>
-
-        <!-- Threat Breakdown -->
-        <div style='display:grid; grid-template-columns:1fr 1fr; gap:10px; margin-bottom:12px;'>
-            <div style='background:#2a1a1a; padding:16px; border-radius:8px; text-align:center;
-                        border:1px solid #5a1a1a;'>
-                <div style='color:#FF4C4C; font-size:0.7em; margin-bottom:6px; letter-spacing:1px;'>
-                     HEURISTIC THREATS
-                </div>
-                <div style='color:#FF4C4C; font-size:2em; font-weight:bold;'>{heuristic_count}</div>
-                <div style='color:#8a4444; font-size:0.65em; margin-top:4px;'>
-                    Known-bad Event IDs & Registry Persistence
-                </div>
-            </div>
-            <div style='background:#2a1f0a; padding:16px; border-radius:8px; text-align:center;
-                        border:1px solid #5a3a0a;'>
-                <div style='color:#FFA500; font-size:0.7em; margin-bottom:6px; letter-spacing:1px;'>
-                     STATISTICAL ANOMALIES
-                </div>
-                <div style='color:#FFA500; font-size:2em; font-weight:bold;'>{statistical_count}</div>
-                <div style='color:#8a6a2a; font-size:0.65em; margin-top:4px;'>
-                    ML-detected behavioral outliers
-                </div>
-            </div>
-        </div>
-
-        <!-- LLM Status -->
-        <div style='background:#132d3f; padding:12px; border-radius:8px; border:1px solid #2a5f7a;
-                    display:flex; justify-content:space-between; align-items:center;'>
-            <span style='color:#5a8a9f; font-size:0.72em;'> RAG Engine</span>
-            <span style='color:{"#5cb85c" if gemini_client else "#FF4C4C"}; font-size:0.75em; font-weight:bold;'>
-                {"● ONLINE" if gemini_client else "● OFFLINE (Set GEMINI_API_KEY)"}
-            </span>
-        </div>
-    </div>
-    """
-
-
-
-
-def get_raw_artifacts():
-    """Return raw dataframe for exploration."""
-    if current_audit_df is None:
-        return pd.DataFrame({"Status": ["Upload an image first"]})
-    
-    cols = ['Date and Time', 'Event ID', 'LogSource', 'ArtifactType', 'Task Category', 'AnomalyLabel']
-    return current_audit_df[[c for c in cols if c in current_audit_df.columns]]
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# SECTION 8: GRADIO UI
-# ═══════════════════════════════════════════════════════════════════════════
-
-CSS = """
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap');
-
-:root {
-    --primary: #6366f1;
-    --secondary: #8b5cf6;
-    --bg-dark: #050810;
-    --card-bg: rgba(15, 23, 42, 0.7);
-    --border-glow: rgba(99, 102, 241, 0.2);
-    --neon-cyan: #00f2ff;
-    --neon-red: #ff4c4c;
-    --neon-amber: #ffa500;
-}
-
-body, .gradio-container {
-    background: radial-gradient(circle at top right, #0a0e1a, #050810) !important;
-    font-family: 'Inter', sans-serif !important;
-    color: #e2e8f0 !important;
-}
-
-/* Glassmorphism Cards */
-.gradio-container .gr-box, .gradio-container .gr-panel {
-    background: var(--card-bg) !important;
-    backdrop-filter: blur(16px) !important;
-    border: 1px solid var(--border-glow) !important;
-    border-radius: 16px !important;
-    box-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.37) !important;
-}
-
-/* Premium Typography */
-h1, h2, h3 {
-    font-family: 'Inter', sans-serif !important;
-    font-weight: 700 !important;
-    letter-spacing: -0.5px !important;
-}
-
-.mono {
-    font-family: 'JetBrains Mono', monospace !important;
-}
-
-/* Glowing Buttons */
-.gr-button-primary {
-    background: linear-gradient(135deg, var(--primary), var(--secondary)) !important;
-    border: none !important;
-    box-shadow: 0 0 15px rgba(99, 102, 241, 0.4) !important;
-    transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1) !important;
-}
-
-.gr-button-primary:hover {
-    transform: translateY(-2px) !important;
-    box-shadow: 0 0 25px rgba(99, 102, 241, 0.6) !important;
-}
-
-/* Interactive Evidence Cards Styling */
-.evidence-card {
-    transition: all 0.2s ease !important;
-    cursor: pointer;
-}
-.evidence-card:hover {
-    transform: scale(1.01) !important;
-    border-color: var(--primary) !important;
-    background: rgba(99, 102, 241, 0.1) !important;
-}
-"""
-
-def generate_pdf_report(investigator, case_id, notes):
-    """Generate a professional forensic PDF report using fpdf2."""
-    from fpdf import FPDF
-    from fpdf.enums import XPos, YPos
-    
-    class ForensicPDF(FPDF):
-        def header(self):
-            self.set_font('helvetica', 'B', 15)
-            self.cell(0, 10, 'OFFICIAL FORENSIC EXAMINATION REPORT', border=False, align='C', new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-            self.set_font('helvetica', 'I', 8)
-            self.cell(0, 10, f'Generated by Forensic Image Analysis Engine v4.0 | {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}', border=False, align='C', new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-            self.ln(10)
-            
-        def footer(self):
-            self.set_y(-15)
-            self.set_font('helvetica', 'I', 8)
-            self.cell(0, 10, f'Page {self.page_no()}/{{nb}} | Case: {case_id}', align='C')
-
-    pdf = ForensicPDF()
-    pdf.add_page()
-    pdf.set_font("helvetica", size=10)
-    
-    # 1. Header Metadata
-    pdf.set_font("helvetica", 'B', 12)
-    pdf.cell(0, 10, "1. CASE METADATA", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-    pdf.set_font("helvetica", size=10)
-    pdf.cell(0, 8, f"Investigator: {investigator}", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-    pdf.cell(0, 8, f"Case Identifier: {case_id}", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-    pdf.cell(0, 8, f"Evidence Hash (SHA-256): {image_hash_sha256}", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-    pdf.ln(5)
-    
-    # 2. Executive Summary
-    pdf.set_font("helvetica", 'B', 12)
-    pdf.cell(0, 10, "2. EXECUTIVE SUMMARY", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-    pdf.set_font("helvetica", size=10)
-    pdf.multi_cell(pdf.epw, 8, f"Notes: {notes}", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-    pdf.cell(0, 8, f"Total Artifacts Analyzed: {artifact_counts.get('total', 0)}", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-    pdf.cell(0, 8, f"Anomalies Detected: {len(current_audit_df[current_audit_df['AnomalyScore'] == -1]) if current_audit_df is not None else 0}", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-    pdf.ln(5)
-    
-    # 3. Investigation Log
-    pdf.set_font("helvetica", 'B', 12)
-    pdf.cell(0, 10, "3. INTERROGATION LOG (Q&A History)", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-    pdf.set_font("helvetica", size=10)
-    
-    for i, entry in enumerate(session_log):
-        pdf.set_font("helvetica", 'B', 10)
-        # Explicit width to avoid "Not enough horizontal space" error
-        pdf.multi_cell(pdf.epw, 8, f"Q{i+1}: {entry['query']}", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-        pdf.set_font("helvetica", size=10)
-        # Clean up HTML/Markdown for PDF
-        answer = entry['answer'].replace('**', '').replace('<br>', '\n')
-        # Use effective page width (epw) for wrapping
-        pdf.multi_cell(pdf.epw, 8, f"A: {answer}", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-        pdf.set_font("helvetica", 'I', 8)
-        pdf.cell(0, 6, f"Evidence Cited: {entry['evidence_ids']}", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-        pdf.ln(4)
-        
-    report_name = f"Forensic_Report_{case_id.replace(' ', '_')}.pdf"
-    output_path = os.path.join(SCRIPT_DIR, "cache", report_name)
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    pdf.output(output_path)
-    return output_path
-
-
-with gr.Blocks() as demo:
-    # -- HEADER --
-    gr.HTML("""
-    <div style='background: linear-gradient(135deg, rgba(99,102,241,0.1), rgba(139,92,246,0.08), rgba(15,23,42,0.9));
-                padding: 24px 32px; border-bottom: 1px solid rgba(99,102,241,0.15);
-                margin: -16px -16px 20px -16px;'>
-        <div style='display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:12px;'>
-            <div>
-                <div style='display:flex; align-items:center; gap:12px;'>
-                    <div style='width:42px; height:42px; border-radius:12px;
-                                background: linear-gradient(135deg, #6366f1, #8b5cf6);
-                                display:flex; align-items:center; justify-content:center;
-                                font-size:1.3em; box-shadow: 0 4px 15px rgba(99,102,241,0.3); color:white;'>DEF</div>
-                    <div>
-                        <h1 style='color:#e2e8f0; margin:0; font-size:1.35em; font-weight:700;
-                                   font-family:Inter,sans-serif; letter-spacing:0.5px;'>
-                            Forensic Analysis Engine
-                        </h1>
-                        <div style='color:#64748b; font-size:0.72em; letter-spacing:2px; margin-top:2px;
-                                    font-family:JetBrains Mono,monospace;'>
-                            v4.0 -- FULL IMAGE INTELLIGENCE
-                        </div>
-                    </div>
-                </div>
-            </div>
-            <div style='display:flex; gap:8px; flex-wrap:wrap;'>
-                <span style='background:rgba(99,102,241,0.12); color:#a5b4fc; padding:4px 12px;
-                             border-radius:20px; font-size:0.65em; font-weight:500; letter-spacing:1px;
-                             border:1px solid rgba(99,102,241,0.2);'>SLEUTHKIT</span>
-                <span style='background:rgba(16,185,129,0.1); color:#6ee7b7; padding:4px 12px;
-                             border-radius:20px; font-size:0.65em; font-weight:500; letter-spacing:1px;
-                             border:1px solid rgba(16,185,129,0.2);'>FAISS + RAG</span>
-                <span style='background:rgba(139,92,246,0.1); color:#c4b5fd; padding:4px 12px;
-                             border-radius:20px; font-size:0.65em; font-weight:500; letter-spacing:1px;
-                             border:1px solid rgba(139,92,246,0.2);'>GEMINI AI</span>
-                <span style='background:rgba(245,158,11,0.1); color:#fcd34d; padding:4px 12px;
-                             border-radius:20px; font-size:0.65em; font-weight:500; letter-spacing:1px;
-                             border:1px solid rgba(245,158,11,0.2);'>MFT . SAM . PREFETCH</span>
-            </div>
-        </div>
-    </div>
-    """)
-
-    with gr.Row():
-        # -- LEFT SIDEBAR --
-        with gr.Column(scale=1, min_width=280):
-            file_input = gr.File(label="FORENSIC IMAGE (.dd / .E01)", file_types=[".dd", ".E01", ".e01", ".raw", ".img"])
-            status = gr.Textbox(label="SYSTEM STATUS", interactive=False, value="Awaiting evidence upload...", lines=4)
-
-            with gr.Accordion("CASE SETUP (FOR REPORTING)", open=False):
-                investigator_input = gr.Textbox(label="Investigator Name", value="Unknown Examiner")
-                case_id_input = gr.Textbox(label="Case ID", value="CASE-2026-001")
-                case_notes_input = gr.TextArea(label="Investigation Notes", placeholder="Enter case context...")
-                export_btn = gr.Button("EXPORT PDF REPORT", variant="secondary")
-                report_file = gr.File(label="Download Report")
-
-            gr.HTML("""
-            <div style='background: linear-gradient(145deg, rgba(15, 23, 42, 0.8), rgba(30, 41, 59, 0.6));
-                        backdrop-filter: blur(12px);
-                        border: 1px solid rgba(99,102,241,0.2); 
-                        border-radius: 16px;
-                        padding: 18px; 
-                        margin-top: 15px;
-                        box-shadow: 0 4px 20px rgba(0,0,0,0.3);'>
-                
-                <div style='margin-bottom: 15px;'>
-                    <div style='color:#94a3b8; font-size:0.65em; letter-spacing:2.5px; font-weight:600;
-                                margin-bottom:10px; font-family:Inter,sans-serif; text-transform:uppercase;'>
-                        Query Guide</div>
-                    <div style='color:#cbd5e1; font-size:0.8em; line-height:1.8; font-family:Inter,sans-serif;'>
-                        <div style='display:flex; justify-content:space-between;'><span style='color:#a5b4fc; font-weight:600;'>summary</span> <span style='color:#64748b;'>forensic overview</span></div>
-                        <div style='display:flex; justify-content:space-between;'><span style='color:#a5b4fc; font-weight:600;'>anomalies</span> <span style='color:#64748b;'>threats & outliers</span></div>
-                        <div style='display:flex; justify-content:space-between;'><span style='color:#a5b4fc; font-weight:600;'>how many users</span> <span style='color:#64748b;'>SAM + profiles</span></div>
-                        <div style='display:flex; justify-content:space-between;'><span style='color:#a5b4fc; font-weight:600;'>files with .pdf</span> <span style='color:#64748b;'>filesystem search</span></div>
-                        <div style='display:flex; justify-content:space-between;'><span style='color:#a5b4fc; font-weight:600;'>installed programs</span> <span style='color:#64748b;'>SOFTWARE hive</span></div>
-                        <div style='display:flex; justify-content:space-between;'><span style='color:#a5b4fc; font-weight:600;'>logs 13:00 to 14:00</span> <span style='color:#64748b;'>time range</span></div>
-                    </div>
-                </div>
-
-                <div style='border-top: 1px solid rgba(99,102,241,0.1); padding-top: 12px;'>
-                    <div style='color:#c4b5fd; font-size:0.65em; letter-spacing:2.5px; font-weight:600;
-                                margin-bottom:8px; font-family:Inter,sans-serif; text-transform:uppercase;'>
-                        AI Examples</div>
-                    <div style='color:#a78bfa; font-size:0.75em; line-height:1.8; font-family:Inter,sans-serif; font-style: italic;'>
-                        "Was there a brute force attack?"<br>
-                        "How many PDF files exist?"<br>
-                        "List all user accounts"<br>
-                        "What programs were executed?"
-                    </div>
-                </div>
-            </div>
-            """)
-
-        # -- MAIN CONTENT --
-        with gr.Column(scale=3):
-            with gr.Tabs(elem_classes="main-tabs"):
-                # TAB 1: AI INVESTIGATION (CHAT)
-                with gr.Tab("AI Investigation"):
-                    gr.HTML("""<div style='color:#94a3b8; font-size:0.7em; letter-spacing:2.5px;
-                                          font-weight:600; margin-bottom:6px; font-family:Inter,sans-serif;'>
-                                 AI INQUIRY TERMINAL</div>""")
-                    query_input = gr.Textbox(
-                        label="QUERY",
-                        placeholder="Ask any forensic question",
-                        lines=1
-                    )
-                    with gr.Row():
-                        btn = gr.Button("EXECUTE QUERY", variant="primary")
-                        stop_btn = gr.Button("STOP", variant="secondary")
-
-                    gr.HTML("""<div style='color:#94a3b8; font-size:0.68em; letter-spacing:2px; font-weight:600;
-                                          margin:16px 0 8px 0; font-family:Inter,sans-serif;
-                                          display:flex; align-items:center; gap:8px;'>
-                                 OUTPUT STREAM</div>""")
-                    chat_output = gr.HTML(
-                        value="""<div style='color:#64748b; font-family:Inter,sans-serif; padding:40px;
-                                            text-align:center; font-size:0.95em;'>
-                            <div style='font-size:2em; margin-bottom:12px; opacity:0.5;'>[INFO]</div>
-                            <div style='font-weight:500;'>Ready for investigation</div>
-                            <div style='font-size:0.8em; margin-top:6px; color:#475569;'>
-                                Upload evidence and ask any question
-                            </div>
-                        </div>""",
-                        elem_id="chat-output-box"
-                    )
-
-                # TAB 2: DASHBOARD
-                with gr.Tab("Dashboard & Summary"):
-                    refresh_btn = gr.Button("Generate Dashboard", variant="primary")
-                    summary_output = gr.HTML(
-                        value="""<div style='color:#64748b; font-family:Inter,sans-serif; padding:40px; text-align:center;'>
-                            Upload a forensic image and click Generate Dashboard.
-                        </div>""",
-                        elem_id="summary-output-box"
-                    )
-
-
-                # TAB 4: RAW ARTIFACTS
-                with gr.Tab("Raw Artifacts"):
-                    gr.HTML("<div style='color:#94a3b8; font-family:Inter,sans-serif; font-size:0.8em; margin-bottom:10px;'>Browse and filter all extracted evidence artifacts.</div>")
-                    artifacts_btn = gr.Button("Load Artifacts", variant="primary")
-                    raw_dataframe = gr.Dataframe(interactive=False, wrap=True)
-
-    # -- EVENT BINDINGS --
-    file_input.change(handle_image_upload, inputs=file_input, outputs=status, show_progress="full")
-    
-    query_click = btn.click(ask_chatbot, inputs=query_input, outputs=chat_output, show_progress="full")
-    query_submit = query_input.submit(ask_chatbot, inputs=query_input, outputs=chat_output, show_progress="full")
-    stop_btn.click(fn=None, inputs=None, outputs=None, cancels=[query_click, query_submit])
-    
-    refresh_btn.click(get_investigation_summary, outputs=summary_output, show_progress="hidden")
-    artifacts_btn.click(get_raw_artifacts, outputs=raw_dataframe, show_progress="hidden")
-    
-    export_btn.click(
-        generate_pdf_report, 
-        inputs=[investigator_input, case_id_input, case_notes_input], 
-        outputs=report_file
-    )
-
-demo.launch(css=CSS)
+if __name__ == "__main__":
+    app, css = build_gui()
+    app.launch(server_port=7860, show_error=True, css=css)

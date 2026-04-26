@@ -40,14 +40,29 @@ model = SentenceTransformer('all-MiniLM-L6-v2')
 
 # 3. Generate the Embeddings
 print(f"Embedding {len(df)} logs. This is the final run!")
-# We use the 'ai_input_list' which we explicitly forced to be strings
-embeddings = model.encode(ai_input_list, show_progress_bar=True)
+# We use the 'ai_input_list' which we explicitly forced to be strings.
+# Chunked encoding keeps terminal feedback readable and avoids long silent waits.
+batch_size = 128
+chunks = []
+for start in range(0, len(ai_input_list), batch_size):
+    end = min(start + batch_size, len(ai_input_list))
+    chunk = ai_input_list[start:end]
+    chunk_embeddings = model.encode(
+        chunk,
+        batch_size=batch_size,
+        show_progress_bar=False,
+        convert_to_numpy=True
+    )
+    chunks.append(chunk_embeddings)
+    print(f"  [EMBED] Processed {end}/{len(ai_input_list)}")
+
+embeddings = np.vstack(chunks).astype('float32')
 
 # 4. Build the FAISS Vector Index
 print("Building the Vector Search Index...")
 dimension = embeddings.shape[1]
 index = faiss.IndexFlatL2(dimension)
-index.add(np.array(embeddings).astype('float32'))
+index.add(embeddings)
 
 # 5. Save the Index and Metadata
 faiss.write_index(index, "forensic_vdb.index")

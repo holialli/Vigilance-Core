@@ -1,59 +1,64 @@
-# 🛡️ Forensic Image Analysis Engine v4.0
+# AI Forensic Engine
 
-A professional-grade digital forensics analysis platform that combines **The SleuthKit**, **Machine Learning**, and **Generative AI (RAG)** to automate evidence carving and interpretation from forensic disk images.
+## Tool Overview
+AI Forensic Engine is a digital forensics analysis tool built for processing forensic disk images and converting raw artifacts into investigator-friendly evidence. The system combines artifact carving, behavioral anomaly screening, retrieval-augmented AI querying, and report generation in one workflow.
 
-## 🚀 Key Features
-- **Parallel Evidence Carving**: Rapidly extracts EVTX logs, Registry Hives, MFT/Filesystem metadata, SAM accounts, Prefetch, Browser History, and User Activity (LNK/JumpLists).
-- **Behavioral Anomaly Detection**: Uses a trained **Isolation Forest** ML model to detect statistical outliers in system events.
-- **AI-Powered Investigation (RAG)**: Integrated Gemini AI for semantic search and natural language interrogation of forensic artifacts.
-- **Legal-Grade Reporting**: Generates cited forensic PDF reports with case metadata and executive summaries.
-- **Forensic Soundness**: Automated SHA-256 hashing for chain of custody verification.
+Core capabilities:
+- Automated extraction of EVTX, registry, filesystem metadata, user activity artifacts, and account traces
+- SHA-256 hashing for source-image integrity tracking
+- Isolation Forest anomaly labeling for suspicious behavior triage
+- FAISS-backed retrieval to support context-grounded forensic question answering
+- PDF reporting with case metadata and evidence summaries
 
----
-
-## 🛠️ Setup Instructions
-
-### 1. Prerequisites
-- **Python 3.10+**
-- **The SleuthKit (Optional but recommended)**: For advanced `.E01` support, ensure `libewf` is installed on your system.
-
-### 2. Environment Setup
-Clone the repository and install dependencies:
-```bash
-# Install dependencies
-pip install -r requirements.txt
-```
-
-### 3. Configuration
-1. Copy the example environment file:
+## Installation Instructions
+1. Clone or download this repository.
+2. Create and activate a Python virtual environment.
+3. Install dependencies:
    ```bash
-   cp .env.example .env
+   pip install -r requirements.txt
    ```
-2. Open `.env` and add your API keys:
-   - `GEMINI_API_KEY`: [Get it here](https://aistudio.google.com/app/apikey)
-   - `GROQ_API_KEY`: [Optional Fallback](https://console.groq.com/keys)
+4. Configure environment variables (if cloud LLM fallback is used):
+   - `GEMINI_API_KEY`
+   - `GROQ_API_KEY` (optional)
 
-### 4. Running the Tool
-```bash
-python src/chatbot_app.py
-```
-Open the local URL (usually `http://127.0.0.1:7860`) in your browser.
+## Dependencies and Prerequisites
+- OS: Windows 10/11 or Linux (WSL also works)
+- Python: 3.10 or newer
+- Memory: 8 GB minimum, 16 GB recommended for larger artifacts
+- Optional forensic support:
+  - The SleuthKit tools
+  - `libewf` for improved `.E01` compatibility
 
----
+Primary Python dependencies include:
+- `gradio`, `pandas`, `numpy`, `scikit-learn`
+- `sentence-transformers`, `faiss-cpu`
+- `python-evtx`, `python-registry`, `pytsk3`
+- `fpdf2` for report generation
 
-## 📂 Project Structure
-- `src/chatbot_app.py`: Main application engine and UI.
-- `src/models/`: Contains the trained Isolation Forest ML model (`forensic_alarm_v2.pkl`).
-- `requirements.txt`: Full list of forensic and AI dependencies.
-- `cache/`: (Ignored) Storage for FAISS indices and processed dataframes.
+## Execution Steps
+1. Start the application:
+   ```bash
+   python src/chatbot_app.py
+   ```
+2. Open the local Gradio URL shown in terminal output.
+3. Upload one or more forensic image files (`.dd`, `.raw`, `.E01` where supported).
+4. Wait for carving and index preparation to finish.
+5. Use:
+   - `AI Investigation` for natural-language forensic queries
+   - `Dashboard & Summary` for case-level overview
+   - `Raw Artifacts` for tabular artifact inspection
 
----
+## Platform Compatibility
+- Windows: Fully supported and recommended for this project context
+- Linux: Supported if required native forensic libraries are installed
+- macOS: Partial support; depends on successful installation of forensic parsing dependencies
 
-## 📝 Usage Tips
-- **Upload Image**: Support for `.dd`, `.raw`, and `.E01` (requires `libewf`).
-- **Dashboard**: Generate a visual summary of the investigation.
-- **Queries**: Ask questions like "How many PDF files exist?", "Was there a brute force attack?", or "Show all user accounts".
-- **Report**: Fill in Case Metadata and click "Export PDF Report" to finalize your investigation.
-
----
-*Developed for Digital Forensics Project - Spring 2026*
+## Troubleshooting
+- If startup fails with missing package errors, run:
+  ```bash
+  pip install -r requirements.txt --upgrade
+  ```
+- If `.E01` parsing fails, verify `libewf` and related bindings are correctly installed.
+- If AI responses are unavailable, confirm API keys in environment settings.
+- If processing appears slow on first run, allow index/cache creation to complete. Subsequent runs on the same evidence hash should be faster.
+- If no evidence appears after upload, check terminal logs for extractor warnings and verify the uploaded image is valid.
