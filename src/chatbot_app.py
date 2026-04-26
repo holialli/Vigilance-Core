@@ -100,19 +100,22 @@ HEURISTIC_THREAT_IDS = {
     8000: "Registry Persistence (Run/RunOnce)",
     8001: "Security Bypass (Defender/UAC Disabled)",
 }
-
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+GEMINI_API_KEY  = os.getenv("GEMINI_API_KEY", "")
 GEMINI_MODEL_ID = "gemini-2.0-flash"
-if not GEMINI_API_KEY:
-    raise RuntimeError(
-        "[ERROR] GEMINI_API_KEY not set. Create a .env file with your key."
-    )
-from google import genai
-gemini_client = genai.Client(api_key=GEMINI_API_KEY)
-print("  [OK] Gemini LLM configured (Modern SDK).")
+gemini_client   = None
+if GEMINI_API_KEY:
+    try:
+        from google import genai
+        gemini_client = genai.Client(api_key=GEMINI_API_KEY)
+        print("  [OK] Gemini LLM configured (Modern SDK).")
+    except Exception as e:
+        print(f"  [WARN] Gemini init failed: {e}")
+else:
+    print("  [WARN] GEMINI_API_KEY not set — Gemini unavailable.")
 
+# ── Groq (cloud fallback) ─────────────────────────────────────────────────
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
-groq_client = None
+groq_client  = None
 if GROQ_API_KEY:
     try:
         from groq import Groq
@@ -120,7 +123,39 @@ if GROQ_API_KEY:
         print("  [OK] Groq LLM configured (Fallback ready).")
     except ImportError:
         print("  [WARN] Groq key found but 'groq' package missing. Run: pip install groq")
+else:
+    print("  [WARN] GROQ_API_KEY not set — Groq unavailable.")
 
+# ── Ollama (local, no rate limits) ────────────────────────────────────────
+import urllib.request
+
+OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+OLLAMA_MODEL    = os.getenv("OLLAMA_MODEL",    "llama3.2")
+
+def check_ollama_available():
+    """Returns True if Ollama server is reachable."""
+    try:
+        req = urllib.request.urlopen(f"{OLLAMA_BASE_URL}/api/tags", timeout=2)
+        return req.status == 200
+    except Exception:
+        return False
+
+ollama_available = check_ollama_available()
+if ollama_available:
+    print(f"  [OK] Ollama available at {OLLAMA_BASE_URL} — model: {OLLAMA_MODEL}")
+else:
+    print(f"  [WARN] Ollama not reachable at {OLLAMA_BASE_URL}. "
+          f"Start it with: ollama serve")
+
+# ── Safety check: at least one LLM must be available ─────────────────────
+if not gemini_client and not groq_client and not ollama_available:
+    raise RuntimeError(
+        "[ERROR] No LLM available. Either:\n"
+        "  • Set GEMINI_API_KEY in .env\n"
+        "  • Set GROQ_API_KEY in .env\n"
+        "  • Run: ollama serve"
+    )
+# ─────────────────────────────────────────────────────────────────────────
 
 # ═══════════════════════════════════════════════════════════════════════════
 # SECTION 2: FORENSIC IMAGE PARSING
@@ -2233,6 +2268,233 @@ def extract_system_context():
         f"ANOMALIES: {anomaly_str}"
     )
 
+def generate_pdf_report(inv_name, case_num, notes_text):
+    """Generate a professional forensic PDF report from the current session."""
+    if current_audit_df is None:
+        return None, "No forensic image loaded. Upload an image first."
+
+    if not inv_name.strip():
+        inv_name = "Unknown Examiner"
+    if not case_num.strip():
+        case_num = "CASE-UNASSIGNED"
+
+    try:
+        from reportlab.lib.pagesizes import A4
+        from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+        from reportlab.lib.units import cm
+        from reportlab.lib import colors
+        from reportlab.platypus import (
+            SimpleDocTemplate, Paragraph, Spacer,
+            Table, TableStyle, HRFlowable
+        )
+
+        report_path = os.path.join(
+            SCRIPT_DIR, "cache",
+            f"ForensicReport_{case_num.replace(' ', '_')}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
+        )
+        os.makedirs(os.path.dirname(report_path), exist_ok=True)
+
+        doc = SimpleDocTemplate(
+            report_path, pagesize=A4,
+            leftMargin=2*cm, rightMargin=2*cm,
+            topMargin=2*cm, bottomMargin=2*cm
+        )
+
+        styles = getSampleStyleSheet()
+
+        # Custom styles
+        title_style = ParagraphStyle(
+            'ForensicTitle',
+            parent=styles['Title'],
+            fontSize=20, textColor=colors.HexColor('#1e3a5f'),
+            spaceAfter=6, fontName='Helvetica-Bold'
+        )
+        heading_style = ParagraphStyle(
+            'ForensicHeading',
+            parent=styles['Heading2'],
+            fontSize=13, textColor=colors.HexColor('#1e3a5f'),
+            spaceBefore=14, spaceAfter=4, fontName='Helvetica-Bold'
+        )
+        subheading_style = ParagraphStyle(
+            'ForensicSub',
+            parent=styles['Heading3'],
+            fontSize=10, textColor=colors.HexColor('#2d6a9f'),
+            spaceBefore=10, spaceAfter=2, fontName='Helvetica-Bold'
+        )
+        body_style = ParagraphStyle(
+            'ForensicBody',
+            parent=styles['Normal'],
+            fontSize=9, leading=14,
+            textColor=colors.HexColor('#1a1a1a'), fontName='Helvetica'
+        )
+        mono_style = ParagraphStyle(
+            'ForensicMono',
+            parent=styles['Code'],
+            fontSize=8, leading=12,
+            textColor=colors.HexColor('#2d2d2d'),
+            backColor=colors.HexColor('#f4f4f4'),
+            fontName='Courier', leftIndent=10
+        )
+        note_style = ParagraphStyle(
+            'ForensicNote',
+            parent=styles['Normal'],
+            fontSize=9, leading=13, fontName='Helvetica-Oblique',
+            textColor=colors.HexColor('#555555')
+        )
+
+        story = []
+        system_facts = extract_system_context()
+
+        # ── HEADER ────────────────────────────────────────────────────────────
+        story.append(Paragraph("DIGITAL FORENSIC EXAMINATION REPORT", title_style))
+        story.append(HRFlowable(width="100%", thickness=2,
+                                color=colors.HexColor('#1e3a5f')))
+        story.append(Spacer(1, 0.3*cm))
+
+        # Case metadata table
+        meta_data = [
+            ["Case Number",      case_num,
+             "Report Generated", datetime.now().strftime('%Y-%m-%d %H:%M:%S')],
+            ["Examiner",         inv_name,
+             "Image SHA-256",    (image_hash_sha256 or "N/A")[:32] + "..."],
+            ["Classification",   "CONFIDENTIAL",
+             "Total Artifacts",  str(len(current_audit_df))],
+        ]
+        meta_table = Table(meta_data, colWidths=[3.5*cm, 6*cm, 3.5*cm, 6*cm])
+        meta_table.setStyle(TableStyle([
+            ('BACKGROUND', (0,0), (0,-1), colors.HexColor('#1e3a5f')),
+            ('BACKGROUND', (2,0), (2,-1), colors.HexColor('#1e3a5f')),
+            ('TEXTCOLOR',  (0,0), (0,-1), colors.white),
+            ('TEXTCOLOR',  (2,0), (2,-1), colors.white),
+            ('FONTNAME',   (0,0), (-1,-1), 'Helvetica'),
+            ('FONTNAME',   (0,0), (0,-1),  'Helvetica-Bold'),
+            ('FONTNAME',   (2,0), (2,-1),  'Helvetica-Bold'),
+            ('FONTSIZE',   (0,0), (-1,-1), 8),
+            ('GRID',       (0,0), (-1,-1), 0.5, colors.HexColor('#cccccc')),
+            ('ROWBACKGROUNDS', (1,0), (-1,-1),
+             [colors.HexColor('#f0f4f8'), colors.HexColor('#ffffff')]),
+            ('PADDING',    (0,0), (-1,-1), 6),
+        ]))
+        story.append(meta_table)
+        story.append(Spacer(1, 0.4*cm))
+
+        # ── EXAMINER NOTES ────────────────────────────────────────────────────
+        if notes_text and notes_text.strip():
+            story.append(Paragraph("Examiner Notes", heading_style))
+            story.append(HRFlowable(width="100%", thickness=0.5,
+                                    color=colors.HexColor('#cccccc')))
+            story.append(Spacer(1, 0.2*cm))
+            story.append(Paragraph(notes_text.strip(), note_style))
+            story.append(Spacer(1, 0.3*cm))
+
+        # ── SYSTEM SUMMARY ────────────────────────────────────────────────────
+        story.append(Paragraph("System & Evidence Summary", heading_style))
+        story.append(HRFlowable(width="100%", thickness=0.5,
+                                color=colors.HexColor('#cccccc')))
+        story.append(Spacer(1, 0.2*cm))
+
+        for line in system_facts.split('\n'):
+            line = line.strip()
+            if not line:
+                continue
+            if ':' in line:
+                key, _, val = line.partition(':')
+                styled_line = f"<b>{key.strip()}:</b> {val.strip()}"
+            else:
+                styled_line = line
+            story.append(Paragraph(styled_line, body_style))
+        story.append(Spacer(1, 0.4*cm))
+
+        # ── INVESTIGATION Q&A LOG ─────────────────────────────────────────────
+        if session_log:
+            story.append(Paragraph("Investigation Query Log", heading_style))
+            story.append(HRFlowable(width="100%", thickness=0.5,
+                                    color=colors.HexColor('#cccccc')))
+            story.append(Spacer(1, 0.2*cm))
+
+            for i, entry in enumerate(session_log, 1):
+                story.append(Paragraph(
+                    f"Query {i} — {entry.get('time', 'N/A')}",
+                    subheading_style
+                ))
+                story.append(Paragraph(
+                    f"<b>Q:</b> {entry['question']}", body_style
+                ))
+                story.append(Spacer(1, 0.1*cm))
+
+                # Clean answer text for PDF
+                answer = entry['answer']
+                answer = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', answer)
+                answer = re.sub(r'\*(.*?)\*',   r'<i>\1</i>', answer)
+
+                for line in answer.split('\n'):
+                    line = line.strip()
+                    if not line:
+                        continue
+                    if line.startswith('- ') or line.startswith('• '):
+                        story.append(Paragraph(
+                            f"&nbsp;&nbsp;&nbsp;• {line[2:]}", body_style
+                        ))
+                    else:
+                        story.append(Paragraph(line, body_style))
+
+                story.append(Spacer(1, 0.3*cm))
+        else:
+            story.append(Paragraph("Investigation Query Log", heading_style))
+            story.append(Paragraph(
+                "No queries were made during this session.", note_style
+            ))
+
+        # ── ARTIFACT COUNTS ───────────────────────────────────────────────────
+        story.append(Paragraph("Artifact Extraction Summary", heading_style))
+        story.append(HRFlowable(width="100%", thickness=0.5,
+                                color=colors.HexColor('#cccccc')))
+        story.append(Spacer(1, 0.2*cm))
+
+        if artifact_counts:
+            counts_data = [["Artifact Type", "Count"]]
+            for k, v in artifact_counts.items():
+                if k != "total":
+                    counts_data.append([k.upper(), str(v)])
+            counts_data.append(["TOTAL", str(artifact_counts.get("total", len(current_audit_df)))])
+
+            counts_table = Table(counts_data, colWidths=[8*cm, 4*cm])
+            counts_table.setStyle(TableStyle([
+                ('BACKGROUND',     (0,0), (-1,0),  colors.HexColor('#1e3a5f')),
+                ('TEXTCOLOR',      (0,0), (-1,0),  colors.white),
+                ('FONTNAME',       (0,0), (-1,0),  'Helvetica-Bold'),
+                ('FONTNAME',       (0,1), (-1,-1), 'Helvetica'),
+                ('FONTSIZE',       (0,0), (-1,-1), 9),
+                ('ROWBACKGROUNDS', (0,1), (-1,-2),
+                 [colors.HexColor('#f0f4f8'), colors.HexColor('#ffffff')]),
+                ('BACKGROUND',     (0,-1), (-1,-1), colors.HexColor('#e8f0e8')),
+                ('FONTNAME',       (0,-1), (-1,-1), 'Helvetica-Bold'),
+                ('GRID',           (0,0), (-1,-1), 0.5, colors.HexColor('#cccccc')),
+                ('ALIGN',          (1,0), (1,-1),  'CENTER'),
+                ('PADDING',        (0,0), (-1,-1), 6),
+            ]))
+            story.append(counts_table)
+
+        # ── FOOTER ────────────────────────────────────────────────────────────
+        story.append(Spacer(1, 0.5*cm))
+        story.append(HRFlowable(width="100%", thickness=1,
+                                color=colors.HexColor('#1e3a5f')))
+        story.append(Paragraph(
+            f"Report generated by VIGILANCE FORENSIC ENGINE v3.1 | "
+            f"Examiner: {inv_name} | {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+            ParagraphStyle('footer', parent=styles['Normal'],
+                           fontSize=7, textColor=colors.HexColor('#888888'),
+                           alignment=1)
+        ))
+
+        doc.build(story)
+        return report_path, f"✅ Report generated: {os.path.basename(report_path)}"
+
+    except ImportError:
+        return None, "❌ ReportLab not installed. Run: pip install reportlab"
+    except Exception as e:
+        traceback.print_exc()
+        return None, f"❌ Report generation failed: {e}"
 
 def format_evidence_block(evidence_context, max_lines=5):
     if not evidence_context:
@@ -2256,6 +2518,38 @@ def build_offline_response(user_question, evidence_context):
     )
 
 
+def query_ollama(prompt, system_prompt):
+    """
+    Send a prompt to a locally running Ollama instance.
+    No API key required. No rate limits.
+    """
+    import json as _json
+    import urllib.request as _req
+
+    payload = _json.dumps({
+        "model":  OLLAMA_MODEL,
+        "prompt": f"{system_prompt}\n\n{prompt}",
+        "stream": False,
+        "options": {
+            "temperature": 0.1,
+            "num_predict": 400,   # max tokens in response
+        }
+    }).encode("utf-8")
+
+    try:
+        request = _req.Request(
+            f"{OLLAMA_BASE_URL}/api/generate",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST"
+        )
+        with _req.urlopen(request, timeout=60) as resp:
+            result = _json.loads(resp.read().decode("utf-8"))
+            return result.get("response", "").strip()
+    except Exception as e:
+        print(f"  [OLLAMA] Query failed: {e}")
+        return None
+
 def query_llm(user_question, evidence_context):
     global cached_system_facts
 
@@ -2265,24 +2559,22 @@ def query_llm(user_question, evidence_context):
 
     system_facts = cached_system_facts
 
-    system_prompt = f"""You are a Senior Digital Forensics Examiner.
-You are analyzing evidence extracted from a forensic disk image. Given the user's question, provide a clear, professional forensic analysis.
+    system_prompt = f"""You are a Senior Digital Forensics Examiner writing a professional case report.
+Analyze the provided evidence and answer the investigator's question clearly and concisely.
 
-── GLOBAL SYSTEM FACTS (CRITICAL - READ FIRST) ──
+── GLOBAL SYSTEM FACTS ──
 {system_facts}
 
-CRITICAL INSTRUCTIONS:
-1. Use the GLOBAL SYSTEM FACTS for aggregate questions.
-2. Use the RETRIEVED EVIDENCE for detailed analysis.
-3. Provide a short evidence-backed answer with minimal narrative.
-4. Always bold key forensic findings, account names, timestamps, and suspicious activities.
-5. Include a short section "EVIDENCE" that lists 1-5 evidence lines verbatim.
-6. List evidence IDs as `USED_EVIDENCE: [id1, id2]`.
-7. Keep responses under 150 words."""
+FORMATTING RULES (STRICT):
+1. Write in clean professional prose. Use **bold** for key findings, usernames, timestamps, and suspicious items.
+2. Use bullet points only when listing multiple discrete items.
+3. DO NOT print raw evidence lines like "[Evidence 0] Time: ...". Never show evidence index numbers.
+4. DO NOT include a section called "EVIDENCE" with raw log lines.
+5. DO NOT include "USED_EVIDENCE: [...]" anywhere in your response.
+6. End with a short "**Key Finding:**" line summarizing the most important discovery.
+7. Keep responses under 180 words total."""
 
-    prompt = f"""{system_prompt}
-
-── RETRIEVED EVIDENCE ──
+    prompt = f"""── RETRIEVED EVIDENCE ──
 {evidence_context}
 
 ── INVESTIGATOR'S QUESTION ──
@@ -2290,20 +2582,32 @@ CRITICAL INSTRUCTIONS:
 
 ── YOUR FORENSIC ANALYSIS ──"""
 
+    # ── Priority 1: Ollama (local, unlimited) ─────────────────────────────
+    if ollama_available:
+        result = query_ollama(prompt, system_prompt)
+        if result:
+            print("  [LLM] Response from Ollama")
+            return result
+        else:
+            print("  [LLM] Ollama failed, falling back...")
+
+    # ── Priority 2: Groq (fast, generous free tier) ───────────────────────
     if groq_client:
         try:
             chat_completion = groq_client.chat.completions.create(
                 messages=[
                     {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": prompt}
+                    {"role": "user",   "content": prompt}
                 ],
                 model="llama-3.3-70b-versatile",
                 temperature=0.2,
             )
+            print("  [LLM] Response from Groq")
             return chat_completion.choices[0].message.content
         except Exception as e:
             print(f"  [LLM] Groq error: {e}")
 
+    # ── Priority 3: Gemini (cloud fallback) ───────────────────────────────
     if gemini_client:
         try:
             response = gemini_client.models.generate_content(
@@ -2311,10 +2615,13 @@ CRITICAL INSTRUCTIONS:
                 contents=prompt,
                 config={"system_instruction": system_prompt, "temperature": 0.1}
             )
+            print("  [LLM] Response from Gemini")
             return response.text
         except Exception as e:
             print(f"  [LLM] Gemini error: {e}")
 
+    # ── Priority 4: Offline deterministic summary ─────────────────────────
+    print("  [LLM] All providers failed — returning deterministic summary")
     return build_offline_response(user_question, evidence_context)
 
 
@@ -2372,140 +2679,492 @@ def handle_image_upload(files):
     # ─────────────────────────────────────────────────────────────────────────
 
     return status_msg
-
 def build_gui():
     CSS = """
-    .sidebar-box { background: #1e293b; padding: 20px; border-radius: 12px; border: 1px solid #334155; }
-    #chat-history { height: 500px; overflow-y: auto; background: #0f172a; border-radius: 8px; border: 1px solid #1e293b; }
-    .stat-card { background: #1e293b; border: 1px solid #334155; padding: 15px; border-radius: 8px; margin: 5px; text-align: center; }
-    #raw-artifacts { height: 520px; overflow: auto; }
+    /* ── Layout ─────────────────────────────────────────────────────────── */
+    .sidebar-box {
+        background: #1e293b;
+        padding: 18px;
+        border-radius: 12px;
+        border: 1px solid #334155;
+        height: 100%;
+        overflow-y: auto;
+    }
+    .main-col {
+        background: #0f172a;
+        border-radius: 12px;
+        padding: 10px;
+    }
+
+    /* ── Stat cards on dashboard ─────────────────────────────────────────── */
+    .stat-card {
+        background: #1e293b;
+        border: 1px solid #334155;
+        padding: 15px;
+        border-radius: 8px;
+        margin: 5px;
+        text-align: center;
+    }
+
+    /* ── Chat window ─────────────────────────────────────────────────────── */
+    #chat-window {
+        height: 520px;
+        overflow-y: auto;
+        background: #0f172a;
+        border-radius: 10px;
+        border: 1px solid #1e293b;
+    }
+
+    /* ── Chatbot bubble overrides ────────────────────────────────────────── */
+    .message.svelte-1lcyrx4.svelte-1lcyrx4 {
+        font-size: 0.93em !important;
+        line-height: 1.6 !important;
+    }
+    .bot.svelte-1lcyrx4 {
+        background: #1e293b !important;
+        border: 1px solid #334155 !important;
+        border-radius: 10px !important;
+        padding: 12px 16px !important;
+        color: #e2e8f0 !important;
+    }
+    .user.svelte-1lcyrx4 {
+        background: #1d4ed8 !important;
+        border-radius: 10px !important;
+        padding: 10px 14px !important;
+        color: #ffffff !important;
+    }
+
+    /* ── Raw artifacts table ─────────────────────────────────────────────── */
+    #raw-artifacts {
+        height: 520px;
+        overflow: auto;
+        font-size: 0.82em;
+    }
+
+    /* ── Status box colours ──────────────────────────────────────────────── */
+    #status-ready textarea  { color: #4ade80 !important; }
+    #status-working textarea { color: #facc15 !important; }
+
+    /* ── Report form ─────────────────────────────────────────────────────── */
+    .report-section {
+        background: #162032;
+        border: 1px solid #2d4a6b;
+        border-radius: 8px;
+        padding: 12px;
+        margin-top: 8px;
+    }
+
+    /* ── Section dividers ────────────────────────────────────────────────── */
+    .section-label {
+        color: #94a3b8;
+        font-size: 0.78em;
+        font-weight: 600;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+        margin: 14px 0 6px 0;
+    }
     """
 
-    with gr.Blocks() as demo:
-        gr.Markdown("## 🛡️ VIGILANCE FORENSIC ENGINE v3.1")
+    # ── Build the interface ───────────────────────────────────────────────────
+    with gr.Blocks(title="VIGILANCE Forensic Engine") as demo:
 
-        with gr.Row():
+        # ── Top banner ───────────────────────────────────────────────────────
+        gr.HTML("""
+        <div style='background:linear-gradient(135deg,#1e3a5f,#1d4ed8);
+                    padding:18px 24px; border-radius:10px; margin-bottom:10px;
+                    display:flex; align-items:center; gap:14px;'>
+            <span style='font-size:2em;'>🛡️</span>
+            <div>
+                <div style='font-size:1.3em; font-weight:700;
+                            color:#ffffff; letter-spacing:0.04em;'>
+                    VIGILANCE FORENSIC ENGINE
+                </div>
+                <div style='font-size:0.78em; color:#93c5fd; margin-top:2px;'>
+                    Digital Forensics Analysis Platform &nbsp;·&nbsp; v3.1
+                </div>
+            </div>
+        </div>
+        """)
+
+        with gr.Row(equal_height=False):
+
+            # ── LEFT SIDEBAR ─────────────────────────────────────────────────
             with gr.Column(scale=1, elem_classes="sidebar-box"):
-                gr.Markdown("### 📂 Case Management")
-                image_input = gr.File(label="Upload Forensic Image", file_count="multiple")
-                upload_btn = gr.Button("🚀 CARVE ARTIFACTS", variant="primary")
-                status_box = gr.Textbox(label="FORENSIC STATUS", value="Standby", interactive=False)
 
-                gr.Markdown("---")
-                gr.Markdown("### 💡 Forensic Inquiry Examples")
-                gr.HTML("<div style='color:#94a3b8; font-size:0.85em;'>"
-                        "• 'List all user accounts'<br>"
-                        "• 'Show USB device history'<br>"
-                        "• 'Find deleted items'</div>")
+                # Case Management
+                gr.HTML("<div class='section-label'>📂 Case Management</div>")
+                image_input = gr.File(
+                    label="Upload Forensic Image (.dd / .E01)",
+                    file_count="multiple"
+                )
+                upload_btn = gr.Button(
+                    "🚀 CARVE ARTIFACTS", variant="primary", size="lg"
+                )
+                status_box = gr.Textbox(
+                    label="FORENSIC STATUS",
+                    value="⏸ Standby — awaiting image",
+                    interactive=False,
+                    elem_id="status-ready"
+                )
 
-            with gr.Column(scale=3):
+                # Quick query hints
+                gr.HTML("""
+                <div class='section-label' style='margin-top:16px;'>
+                    💡 Example Queries
+                </div>
+                <div style='background:#0f172a; border-radius:6px;
+                            padding:10px 12px; font-size:0.82em;
+                            color:#94a3b8; line-height:1.9;'>
+                    • List all user accounts<br>
+                    • Show USB device history<br>
+                    • Were any audit logs cleared?<br>
+                    • What programs were recently executed?<br>
+                    • Find any suspicious registry entries
+                </div>
+                """)
+
+                # Report generation form
+                gr.HTML("""
+                <div class='section-label' style='margin-top:16px;'>
+                    📋 Report Generation
+                </div>
+                """)
+
+                with gr.Group(elem_classes="report-section"):
+                    report_inv_name = gr.Textbox(
+                        label="Investigator Name",
+                        placeholder="e.g. Det. Sarah Chen",
+                        max_lines=1
+                    )
+                    report_case_num = gr.Textbox(
+                        label="Case Number",
+                        placeholder="e.g. CASE-2026-042",
+                        max_lines=1
+                    )
+                    report_notes = gr.Textbox(
+                        label="Case Notes",
+                        placeholder="Observations, context, or notes "
+                                    "to include in the report...",
+                        lines=4
+                    )
+                    report_btn = gr.Button(
+                        "📄 Generate PDF Report",
+                        variant="secondary",
+                        size="sm"
+                    )
+                    report_status = gr.Textbox(
+                        label="Report Status",
+                        interactive=False,
+                        max_lines=2,
+                        visible=True
+                    )
+                    report_file = gr.File(
+                        label="⬇ Download Report",
+                        visible=False
+                    )
+
+            # ── MAIN PANEL ───────────────────────────────────────────────────
+            with gr.Column(scale=3, elem_classes="main-col"):
                 with gr.Tabs():
 
-                    with gr.Tab("AI Investigation"):
+                    # Tab 1 — AI Chat
+                    with gr.Tab("🔍 AI Investigation"):
                         chatbot = gr.Chatbot(
-                            label="Forensic Reasoning Logs",
-                            height=500,
-                            elem_id="chat-history"
+                            label="",
+                            height=520,
+                            elem_id="chat-window",
+                            show_label=False,
                         )
                         with gr.Row():
                             msg = gr.Textbox(
-                                placeholder="Enter forensic query...",
-                                scale=9, container=False, show_label=False
+                                placeholder="Ask a forensic question...",
+                                scale=9,
+                                container=False,
+                                show_label=False,
+                                lines=1,
                             )
-                            submit_btn = gr.Button("Send", scale=1, variant="primary")
+                            submit_btn = gr.Button(
+                                "Send ➤", scale=1, variant="primary"
+                            )
+                        gr.HTML("""
+                        <div style='font-size:0.75em; color:#475569;
+                                    text-align:center; margin-top:4px;'>
+                            Responses are AI-generated and should be verified
+                            against raw artifact data.
+                        </div>
+                        """)
 
-                    with gr.Tab("Dashboard & Summary"):
-                        refresh_btn = gr.Button("🔄 REFRESH CASE SUMMARY", variant="primary")
+                    # Tab 2 — Dashboard
+                    with gr.Tab("📊 Dashboard"):
+                        with gr.Row():
+                            refresh_btn = gr.Button(
+                                "🔄 Refresh Summary", variant="primary", size="sm"
+                            )
                         summary_output = gr.HTML(
-                            value="<div style='text-align:center; padding:50px; color:#94a3b8;'>"
-                                  "Upload a Case Image to generate summary.</div>"
+                            value="""
+                            <div style='text-align:center; padding:60px 20px;
+                                        color:#475569;'>
+                                <div style='font-size:2.5em; margin-bottom:12px;'>
+                                    🖴
+                                </div>
+                                <div style='font-size:1em; font-weight:600;'>
+                                    No case loaded
+                                </div>
+                                <div style='font-size:0.85em; margin-top:6px;'>
+                                    Upload a forensic image and click
+                                    CARVE ARTIFACTS to begin.
+                                </div>
+                            </div>
+                            """
                         )
 
-                    with gr.Tab("Raw Artifacts"):
-                        artifacts_btn = gr.Button("Load Artifacts Dataframe")
+                    # Tab 3 — Raw Artifacts
+                    with gr.Tab("🗂 Raw Artifacts"):
+                        with gr.Row():
+                            artifacts_btn = gr.Button(
+                                "Load Artifact Table",
+                                variant="secondary",
+                                size="sm"
+                            )
+                            gr.HTML("""
+                            <div style='font-size:0.8em; color:#64748b;
+                                        padding:6px 0;'>
+                                Showing all extracted artifacts from
+                                the loaded forensic image.
+                            </div>
+                            """)
                         raw_dataframe = gr.Dataframe(
-                            interactive=False, wrap=True, elem_id="raw-artifacts"
+                            interactive=False,
+                            wrap=True,
+                            elem_id="raw-artifacts"
                         )
+
+        # ── INNER CALLBACKS ───────────────────────────────────────────────────
 
         def respond(message, history):
-                # ── FIX-5: Guard against querying before background build completes ──
-            if faiss_index is None and current_audit_df is not None:
-                not_ready_msg = (
-                    "⏳ The forensic index is still being built in the background. "
-                    "Please wait 15–30 seconds and try again."
-                )
-                history = history or []
-                history.append({"role": "user", "content": message})
-                history.append({"role": "assistant", "content": not_ready_msg})
+            """Handle a chat query through RAG → LLM pipeline."""
+            # Guard: no image loaded
+            if current_audit_df is None:
+                reply = ("⚠️ No forensic image is loaded. "
+                         "Please upload an image and carve artifacts first.")
+                history = list(history or [])
+                history.append({"role": "user",      "content": message})
+                history.append({"role": "assistant", "content": reply})
                 return "", history
-            # ─────────────────────────────────────────────────────────────────────
+
+            # Guard: FAISS index still building
+            if faiss_index is None:
+                reply = ("⏳ The forensic index is still building in the background. "
+                         "Please wait 15–30 seconds and try again.")
+                history = list(history or [])
+                history.append({"role": "user",      "content": message})
+                history.append({"role": "assistant", "content": reply})
+                return "", history
+
+            # Normalise history format
             clean_history = []
             for item in history:
                 if isinstance(item, (list, tuple)):
-                    clean_history.append({"role": "user", "content": str(item[0])})
-                    clean_history.append({"role": "assistant", "content": str(item[1])})
+                    clean_history.append(
+                        {"role": "user",      "content": str(item[0])}
+                    )
+                    clean_history.append(
+                        {"role": "assistant", "content": str(item[1])}
+                    )
                 else:
                     clean_history.append(item)
 
-            relevant_rows, context_text = build_rag_context(message)
+            # RAG retrieval + LLM
+            _rows, context_text = build_rag_context(message)
             bot_message = query_llm(message, context_text)
-            evidence_block = format_evidence_block(context_text)
-            if evidence_block and "EVIDENCE:" not in bot_message:
-                bot_message = f"{bot_message}\n\nEVIDENCE:\n{evidence_block}"
 
-            clean_history.append({"role": "user", "content": message})
+            # Strip any raw evidence lines the LLM may still emit
+            bot_message = re.sub(
+                r'\n?EVIDENCE:\n(\-\s*\[Evidence\s*\d+\][^\n]*\n?)+',
+                '', bot_message
+            )
+            bot_message = re.sub(
+                r'\n?USED_EVIDENCE:\s*\[.*?\]', '', bot_message
+            )
+            bot_message = re.sub(
+                r'\n?\[Evidence\s*\d+\]\s*Time:[^\n]+', '', bot_message
+            )
+            bot_message = bot_message.strip()
+
+            # Persist to session log for PDF report
+            session_log.append({
+                "question": message,
+                "answer":   bot_message,
+                "time":     datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            })
+
+            clean_history.append({"role": "user",      "content": message})
             clean_history.append({"role": "assistant", "content": bot_message})
-
             return "", clean_history
 
         def get_styled_summary():
+            """Render the dashboard HTML summary panel."""
             if current_audit_df is None:
-                return ("<div style='color:#94a3b8;text-align:center;'>"
-                        "Upload a Case to begin summary analysis.</div>")
+                return """
+                <div style='text-align:center; padding:60px 20px; color:#475569;'>
+                    <div style='font-size:2.5em; margin-bottom:12px;'>🖴</div>
+                    <div style='font-weight:600;'>No case loaded</div>
+                </div>
+                """
+
             raw = extract_system_context()
 
-            try:
-                host = raw.split("HOST: ")[1].split(" | ")[0]
-                os_ver = raw.split("OS: ")[1].split("\n")[0]
-                total_logs = raw.split("TOTAL LOGS: ")[1].split("\n")[0]
-            except:
-                host, os_ver, total_logs = "Unknown Host", "Unknown OS", "0"
+            # Safe key extraction with fallbacks
+            def _extract(key, fallback="N/A"):
+                try:
+                    return raw.split(f"{key}: ")[1].split("\n")[0].split(" | ")[0]
+                except Exception:
+                    return fallback
 
-            html = f"""
-            <div style='display: grid; grid-template-columns: repeat(3, 1fr);
-                        gap: 15px; margin-bottom: 20px;'>
+            host       = _extract("HOST")
+            os_ver     = _extract("OS")
+            total_logs = _extract("TOTAL LOGS")
+            alerts     = _extract("ALERTS")
+            users      = _extract("SAM USERS")
+            anomalies  = _extract("ANOMALIES")
+            time_range = _extract("RANGE")
+
+            # Determine alert badge colour
+            alert_color = (
+                "#ef4444" if "DISABLED" in alerts.upper()
+                          or "CLEARED"  in alerts.upper()
+                else "#22c55e"
+            )
+
+            stat_cards = f"""
+            <div style='display:grid; grid-template-columns:repeat(4,1fr);
+                        gap:12px; margin-bottom:16px;'>
                 <div class='stat-card'>
-                    <h4 style='color:#3b82f6;margin:0;'>HOST</h4>
-                    <p style='margin:5px 0;'>{host}</p>
+                    <div style='color:#60a5fa; font-size:0.75em;
+                                font-weight:600; margin-bottom:4px;'>
+                        HOST
+                    </div>
+                    <div style='font-weight:700; font-size:0.95em;'>
+                        {host}
+                    </div>
                 </div>
                 <div class='stat-card'>
-                    <h4 style='color:#3b82f6;margin:0;'>OS</h4>
-                    <p style='margin:5px 0;'>{os_ver}</p>
+                    <div style='color:#60a5fa; font-size:0.75em;
+                                font-weight:600; margin-bottom:4px;'>
+                        OS
+                    </div>
+                    <div style='font-weight:700; font-size:0.95em;'>
+                        {os_ver}
+                    </div>
                 </div>
                 <div class='stat-card'>
-                    <h4 style='color:#3b82f6;margin:0;'>ARTIFACTS</h4>
-                    <p style='margin:5px 0;'>{total_logs}</p>
+                    <div style='color:#60a5fa; font-size:0.75em;
+                                font-weight:600; margin-bottom:4px;'>
+                        TOTAL ARTIFACTS
+                    </div>
+                    <div style='font-weight:700; font-size:1.1em;
+                                color:#4ade80;'>
+                        {total_logs}
+                    </div>
+                </div>
+                <div class='stat-card'>
+                    <div style='color:#60a5fa; font-size:0.75em;
+                                font-weight:600; margin-bottom:4px;'>
+                        ALERTS
+                    </div>
+                    <div style='font-weight:700; font-size:0.85em;
+                                color:{alert_color};'>
+                        {alerts}
+                    </div>
                 </div>
             </div>
-            <div style='background:#0f172a; padding:20px; border-radius:8px;
-                        border:1px solid #1e293b; color:#cbd5e1; font-family:monospace;
-                        font-size:0.9em; height:450px; overflow-y:auto;'>
-                {raw.replace(chr(10), '<br>')}
+
+            <div style='display:grid; grid-template-columns:repeat(3,1fr);
+                        gap:12px; margin-bottom:16px;'>
+                <div class='stat-card'>
+                    <div style='color:#a78bfa; font-size:0.75em;
+                                font-weight:600; margin-bottom:4px;'>
+                        USERS (SAM)
+                    </div>
+                    <div style='font-size:0.85em;'>{users}</div>
+                </div>
+                <div class='stat-card'>
+                    <div style='color:#a78bfa; font-size:0.75em;
+                                font-weight:600; margin-bottom:4px;'>
+                        ANOMALY SCORE
+                    </div>
+                    <div style='font-size:0.85em;'>{anomalies}</div>
+                </div>
+                <div class='stat-card'>
+                    <div style='color:#a78bfa; font-size:0.75em;
+                                font-weight:600; margin-bottom:4px;'>
+                        TIME RANGE
+                    </div>
+                    <div style='font-size:0.8em;'>{time_range}</div>
+                </div>
             </div>
             """
-            return html
 
-        upload_btn.click(handle_image_upload, inputs=[image_input], outputs=[status_box])
-        msg.submit(respond, [msg, chatbot], [msg, chatbot], show_progress="hidden")
-        submit_btn.click(respond, [msg, chatbot], [msg, chatbot], show_progress="hidden")
-        refresh_btn.click(get_styled_summary, outputs=summary_output)
+            # Full monospace dump
+            mono_dump = raw.replace("<", "&lt;").replace(">", "&gt;")
+            mono_dump = mono_dump.replace("\n", "<br>")
+
+            full_panel = f"""
+            <div style='background:#0f172a; padding:16px 20px;
+                        border-radius:8px; border:1px solid #1e293b;
+                        color:#cbd5e1; font-family:monospace;
+                        font-size:0.85em; line-height:1.7;
+                        max-height:380px; overflow-y:auto;'>
+                {mono_dump}
+            </div>
+            """
+
+            return stat_cards + full_panel
+
+        def _handle_report(inv_name, case_num, notes):
+            """Wrapper — avoids variable name clash with msg textbox."""
+            pdf_path, status_msg = generate_pdf_report(inv_name, case_num, notes)
+            if pdf_path and os.path.exists(pdf_path):
+                return status_msg, gr.update(value=pdf_path, visible=True)
+            return status_msg, gr.update(visible=False)
+
+        # ── WIRE EVENTS ───────────────────────────────────────────────────────
+        upload_btn.click(
+            handle_image_upload,
+            inputs=[image_input],
+            outputs=[status_box]
+        )
+        msg.submit(
+            respond,
+            inputs=[msg, chatbot],
+            outputs=[msg, chatbot],
+            show_progress="hidden"
+        )
+        submit_btn.click(
+            respond,
+            inputs=[msg, chatbot],
+            outputs=[msg, chatbot],
+            show_progress="hidden"
+        )
+        refresh_btn.click(
+            get_styled_summary,
+            outputs=[summary_output]
+        )
         artifacts_btn.click(
-            lambda: current_audit_df if current_audit_df is not None else pd.DataFrame(),
-            outputs=raw_dataframe
+            fn=lambda: (
+                current_audit_df
+                if current_audit_df is not None
+                else pd.DataFrame()
+            ),
+            outputs=[raw_dataframe]
+        )
+        report_btn.click(
+            _handle_report,
+            inputs=[report_inv_name, report_case_num, report_notes],
+            outputs=[report_status, report_file]
         )
 
     return demo, CSS
-
 
 if __name__ == "__main__":
     app, css = build_gui()
