@@ -11,8 +11,11 @@ from datetime import datetime, timedelta, timezone
 
 import pandas as pd
 
-from .config import debug_extract
+from .config import HASHSET_BAD_PATH, HASHSET_GOOD_PATH, debug_extract
+from .hashsets import (hash_image_files, hash_summary, load_hashset,
+                       match_hashsets)
 from .parsers import EWFImgInfo, parse_evtx_file, parse_registry_hive
+from .shimcache import parse_appcompatcache
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -948,6 +951,20 @@ def extract_browser_history(fs):
     return pd.DataFrame(records)
 
 
+def _is_deleted(entry):
+    """True when TSK marks the name or metadata record as unallocated."""
+    try:
+        import pytsk3
+        name_flags = entry.info.name.flags if entry.info.name else 0
+        meta_flags = entry.info.meta.flags if entry.info.meta else 0
+        return bool(
+            (name_flags & pytsk3.TSK_FS_NAME_FLAG_UNALLOC)
+            or (meta_flags & pytsk3.TSK_FS_META_FLAG_UNALLOC)
+        )
+    except Exception:
+        return False
+
+
 def walk_filesystem(fs, limit=150000, max_depth=14):
     records = []
     print("  [CARVE] Indexing Filesystem (Autopsy Mode)...")
@@ -988,24 +1005,27 @@ def walk_filesystem(fs, limit=150000, max_depth=14):
                              .strftime('%Y-%m-%d %H:%M:%S UTC')
                              if meta and meta.mtime else 'N/A')
                     size = meta.size if meta and meta.size else 0
+                    deleted = _is_deleted(entry)
 
                     if is_file or is_dir:
                         ftype = "Directory" if is_dir else "File"
+                        prefix = "Deleted " if deleted else ""
                         records.append({
                             'Date and Time': mtime,
-                            'Event ID': '9100',
+                            'Event ID': '9101' if deleted else '9100',
                             'Task Category': (
-                                f"{ftype} Discovery: {name} "
+                                f"{prefix}{ftype} Discovery: {name} "
                                 f"({ext.upper()}) at {fpath}"
                             ),
                             'LogSource': 'FILESYSTEM',
-                            'Keywords': 'None',
-                            'ArtifactType': 'FILESYSTEM',
+                            'Keywords': 'Alert' if deleted else 'None',
+                            'ArtifactType': 'DELETED' if deleted else 'FILESYSTEM',
                             '_filepath': fpath,
                             '_filename': name,
                             '_extension': ext,
                             '_size': size,
                             '_is_dir': is_dir,
+                            '_deleted': deleted,
                         })
 
                     if is_dir and depth < max_depth and name.lower() not in skip_dirs:
@@ -1020,8 +1040,13 @@ def walk_filesystem(fs, limit=150000, max_depth=14):
         fast_walk(root)
     if len(records) < limit:
         fast_walk("/")
+    # Orphaned MFT entries: files whose parent directory is gone. TSK exposes
+    # them under a synthetic $OrphanFiles node that a normal walk never reaches.
+    fast_walk("/$OrphanFiles")
 
-    print(f"  [OK] Indexed {len(records)} files/folders.")
+    deleted_count = sum(1 for r in records if r['_deleted'])
+    print(f"  [OK] Indexed {len(records)} files/folders "
+          f"({deleted_count} deleted/orphaned).")
     return pd.DataFrame(records)
 
 
@@ -1125,13 +1150,70 @@ def extract_usn_journal(fs):
 # ═══════════════════════════════════════════════════════════════════════════
 
 def extract_execution_history(fs):
+    """Parse AppCompatCache (ShimCache) from the SYSTEM hive.
+
+    Evidence of program presence/execution that survives deletion of the binary.
     """
-    ShimCache data is already captured by extract_system_artifact() under
-    REGISTRY. current_audit_df is None at extraction time, so attempting
-    to read it here would crash. Return empty; data is available via RAG.
-    """
-    print("  [EXEC] ShimCache captured via REGISTRY extraction; skipping re-extraction.")
-    return pd.DataFrame()
+    from Registry import Registry as reg_lib
+
+    reg_data = None
+    for path in ("/Windows/System32/config/SYSTEM", "/Windows/System32/config/system"):
+        try:
+            f_obj = fs.open(path)
+            reg_data = f_obj.read_random(0, f_obj.info.meta.size)
+            break
+        except Exception:
+            continue
+
+    if not reg_data:
+        return pd.DataFrame()
+
+    with tempfile.NamedTemporaryFile(suffix=".hive", delete=False) as tmp:
+        tmp.write(reg_data)
+        tmp_path = tmp.name
+
+    records = []
+    try:
+        registry = reg_lib.Registry(tmp_path)
+        for control_set in ("ControlSet001", "ControlSet002"):
+            for key_path in (
+                f"{control_set}\\Control\\Session Manager\\AppCompatCache",
+                f"{control_set}\\Control\\Session Manager\\AppCompatibility",
+            ):
+                try:
+                    key = registry.open(key_path)
+                    raw = key.value("AppCompatCache").value()
+                except Exception:
+                    continue
+
+                entries = parse_appcompatcache(raw)
+                if entries:
+                    print(f"  [EXEC] {len(entries)} ShimCache entries from {key_path}")
+                for entry in entries:
+                    records.append({
+                        'Date and Time': entry["last_modified"],
+                        'Event ID': '9500',
+                        'Task Category': (
+                            f"Program Execution Evidence: {entry['path']} "
+                            f"({entry['source']}, last modified: {entry['last_modified']})"
+                        ),
+                        'LogSource': 'SHIMCACHE',
+                        'Keywords': 'Alert',
+                        'ArtifactType': 'EXECUTION',
+                    })
+                if records:
+                    break
+            if records:
+                break
+    except Exception as e:
+        print(f"  [EXEC] ShimCache parse error: {e}")
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except Exception:
+            pass
+
+    return pd.DataFrame(records)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1435,9 +1517,11 @@ def carve_evidence_from_image(image_source):
             )
         print(f"   Could not read volume/partition table: {e}")
 
+    fs_offset = None
     for offset in offsets_to_try:
         try:
             fs = pytsk3.FS_Info(img_info, offset=offset)
+            fs_offset = offset
             print(f"  [OK] Filesystem found at offset {offset}")
             break
         except Exception:
@@ -1449,31 +1533,56 @@ def carve_evidence_from_image(image_source):
             f"Tried offsets: {offsets_to_try}."
         )
 
+    def open_fs():
+        """Open an independent filesystem handle.
+
+        A TSK filesystem handle is not safe to share across threads: concurrent
+        directory walks corrupt each other's state, which showed up as random
+        '$IDX_ROOT not found' failures and silently empty extractors. Each task
+        therefore gets its own handle over its own image handle.
+        """
+        if is_e01:
+            import pyewf
+            handle = pyewf.handle()
+            handle.open(filepaths)
+            own_img = EWFImgInfo(handle)
+        else:
+            own_img = pytsk3.Img_Info(primary_file)
+        return pytsk3.FS_Info(own_img, offset=fs_offset)
+
+    def isolated(fn, *extra):
+        """Run an extractor against its own filesystem handle."""
+        def runner():
+            return fn(open_fs(), *extra)
+        return runner
+
     # FIX-9: SRUM and EXECUTION are independent named tasks
     print(f"  [EXEC] Starting parallel artifact extraction (Max Workers: 14)...")
 
     tasks = [
-        ("EVTX",          extract_all_evtx,               (fs,)),
-        ("SYSTEM",        extract_system_artifact,         (fs,)),
-        ("SAM",           extract_sam_hive,                (fs,)),
-        ("SOFTWARE",      extract_software_hive,           (fs,)),
-        ("USB",           extract_usb_devices,             (fs,)),
-        ("NTUSER",        extract_all_ntuser,              (fs,)),   # FIX-5
-        ("PREFETCH",      extract_prefetch,                (fs,)),
-        ("FILESYSTEM",    walk_filesystem,                 (fs, 150000)),
-        ("ACTIVITY",      extract_user_activity,           (fs,)),
-        ("RECENT",        extract_recent_documents,        (fs,)),   # FIX-4
-        ("RECYCLE",       extract_recycle_bin,             (fs,)),
-        ("BROWSER",       extract_browser_history,         (fs,)),   # FIX-3
-        ("COMMUNICATION", extract_communication_artifacts, (fs,)),   # FIX-6
-        ("USN",           extract_usn_journal,             (fs,)),
-        ("EXECUTION",     extract_execution_history,       (fs,)),   # FIX-8
-        ("SRUM",          extract_srum_data,               (fs,)),   # FIX-7
+        ("EVTX",          isolated(extract_all_evtx)),
+        ("SYSTEM",        isolated(extract_system_artifact)),
+        ("SAM",           isolated(extract_sam_hive)),
+        ("SOFTWARE",      isolated(extract_software_hive)),
+        ("USB",           isolated(extract_usb_devices)),
+        ("NTUSER",        isolated(extract_all_ntuser)),             # FIX-5
+        ("PREFETCH",      isolated(extract_prefetch)),
+        ("FILESYSTEM",    isolated(walk_filesystem, 150000)),
+        ("ACTIVITY",      isolated(extract_user_activity)),
+        ("RECENT",        isolated(extract_recent_documents)),       # FIX-4
+        ("RECYCLE",       isolated(extract_recycle_bin)),
+        ("BROWSER",       isolated(extract_browser_history)),        # FIX-3
+        ("COMMUNICATION", isolated(extract_communication_artifacts)),  # FIX-6
+        ("USN",           isolated(extract_usn_journal)),
+        ("EXECUTION",     isolated(extract_execution_history)),      # FIX-8
+        ("SRUM",          isolated(extract_srum_data)),              # FIX-7
     ]
+
+    filesystem_df = None
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=14) as executor:
         future_to_name = {
-            executor.submit(fn, *args): name for name, fn, args in tasks
+            executor.submit(fn): name for name, fn in tasks
         }
         for future in concurrent.futures.as_completed(future_to_name):
             name = future_to_name[future]
@@ -1481,6 +1590,8 @@ def carve_evidence_from_image(image_source):
                 df = future.result()
                 if df is not None and not df.empty:
                     all_frames.append(df)
+                    if name == "FILESYSTEM":
+                        filesystem_df = df
                     if name == "EVTX":         artifact_counts["evtx"]       = len(df)
                     elif name == "SAM":        artifact_counts["sam"]        = len(df)
                     elif name == "SOFTWARE":   artifact_counts["software"]   = len(df)
@@ -1497,6 +1608,19 @@ def carve_evidence_from_image(image_source):
                 if debug_extract:
                     traceback.print_exc()
 
+    # Hashing runs after the parallel phase because it consumes the file list
+    # produced by walk_filesystem.
+    if filesystem_df is not None and not filesystem_df.empty:
+        try:
+            hash_df = _hash_and_match(fs, filesystem_df)
+            if hash_df is not None and not hash_df.empty:
+                all_frames.append(hash_df)
+                artifact_counts["hashmatch"] = len(hash_df)
+        except Exception as exc:
+            print(f"  [FAIL] Hashing pass failed: {exc}")
+            if debug_extract:
+                traceback.print_exc()
+
     if not all_frames:
         raise RuntimeError(
             f"[ERROR] No artifacts extracted from '{os.path.basename(primary_file)}'."
@@ -1505,3 +1629,31 @@ def carve_evidence_from_image(image_source):
     result = pd.concat(all_frames, ignore_index=True)
     artifact_counts["total"] = len(result)
     return result, artifact_counts
+
+
+def _hash_and_match(fs, filesystem_df):
+    """Hash notable files and compare them against configured hash sets.
+
+    Skipped entirely when no hash sets exist: hashing reads every candidate file
+    out of the image and dominates carve time, which is wasted with nothing to
+    match against.
+    """
+    known_bad = load_hashset(HASHSET_BAD_PATH)
+    known_good = load_hashset(HASHSET_GOOD_PATH)
+    if not known_bad and not known_good:
+        print("  [HASH] No hash sets configured — skipping hashing pass. "
+              f"Add hashes to {HASHSET_BAD_PATH} to enable.")
+        return pd.DataFrame()
+
+    rows = filesystem_df.to_dict('records')
+    print(f"  [HASH] Hashing notable files from {len(rows)} filesystem entries...")
+    hashed = hash_image_files(fs, rows)
+
+    summary = hash_summary(hashed)
+    print(f"  [HASH] {summary['hashed']} hashed | "
+          f"{summary['known_bad']} known-bad | {summary['known_good']} known-good")
+
+    if not known_bad and not known_good:
+        print("  [HASH] No hash sets configured — hashes computed but unmatched.")
+
+    return match_hashsets(hashed, known_bad, known_good)

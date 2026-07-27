@@ -10,6 +10,12 @@ CACHE_DIR = os.path.join(SCRIPT_DIR, "cache")
 MODELS_DIR = os.path.join(SCRIPT_DIR, "models")
 MODEL_PATH = os.path.join(MODELS_DIR, "forensic_alarm_v2.pkl")
 
+HASHSET_DIR = os.path.join(SCRIPT_DIR, "hashsets")
+HASHSET_BAD_PATH = os.getenv(
+    "HASHSET_BAD", os.path.join(HASHSET_DIR, "known_bad.txt"))
+HASHSET_GOOD_PATH = os.getenv(
+    "HASHSET_GOOD", os.path.join(HASHSET_DIR, "known_good.txt"))
+
 debug_extract = True
 
 HEURISTIC_THREAT_IDS = {

@@ -17,7 +17,9 @@ import pandas as pd
 from forensics.analysis import (activity_peaks, anomaly_overview, build_timeline,
                                 format_triage_markdown, search_artifacts,
                                 triage_findings)
+from forensics.cases import list_cases, load_case, save_case
 from forensics.config import CACHE_DIR, debug_extract
+from forensics.correlation import build_correlations, pivot_entity, top_entities
 from forensics.context import extract_system_context
 from forensics.extractors import carve_evidence_from_image
 from forensics.llm import ensure_llm_available, query_llm
@@ -27,6 +29,28 @@ from forensics.rag import build_rag_context, format_citations
 from forensics.reporting import generate_pdf_report
 from forensics.session import CaseSession
 
+
+
+def _activate_case(session, df, image_hash, artifact_counts):
+    """Point a session at a set of carved artifacts and warm its indexes."""
+    session.current_audit_df = df
+    session.image_hash_sha256 = image_hash
+    session.artifact_counts = artifact_counts
+    session.cached_system_facts = None
+    session.faiss_index = None  # Force index rebuild for new image
+    session.correlation_db = build_correlations(df)
+
+    def _background_index_build():
+        try:
+            print("  [FAISS] Background index build started...")
+            build_rag_context("Init", session)
+            print("  [FAISS] Background index build complete.")
+        except Exception as e:
+            print(f"  [FAISS] Background index build failed: {e}")
+            if debug_extract:
+                traceback.print_exc()
+
+    threading.Thread(target=_background_index_build, daemon=True).start()
 
 
 def handle_image_upload(files, session):
@@ -53,34 +77,17 @@ def handle_image_upload(files, session):
         print(f"  [IMAGE] Analyzing new forensic source...")
         df, artifact_counts = carve_evidence_from_image(filepaths)
         df = engineer_features(df)
-        df.to_pickle(artifact_path)
         status_msg = (
             f"Forensic Image Carved: {len(df)} artifacts identified. "
             f"SHA-256: {image_hash_sha256}"
         )
 
-    # ── REQ-6: Always reset state and trigger background index build ─────────
-    # Applies to both fresh carves AND cache loads so repeated uploads work.
-    session.current_audit_df = df
-    session.image_hash_sha256 = image_hash_sha256
-    session.artifact_counts = artifact_counts
-    session.cached_system_facts = None
-    session.faiss_index = None  # Force index rebuild for new image
-
-    def _background_index_build():
-        try:
-            print("  [FAISS] Background index build started...")
-            build_rag_context("Init", session)
-            print("  [FAISS] Background index build complete.")
-        except Exception as e:
-            print(f"  [FAISS] Background index build failed: {e}")
-            if debug_extract:
-                traceback.print_exc()
-
-    threading.Thread(target=_background_index_build, daemon=True).start()
-    # ─────────────────────────────────────────────────────────────────────────
-
+    save_case(image_hash_sha256, df, source_image=os.path.basename(primary_file),
+              artifact_counts=artifact_counts)
+    _activate_case(session, df, image_hash_sha256, artifact_counts)
     return status_msg
+
+
 def build_gui():
     CSS = """
     /* ── Layout ─────────────────────────────────────────────────────────── */
@@ -356,7 +363,66 @@ def build_gui():
                             label="Busiest days", interactive=False, wrap=True
                         )
 
-                    # Tab 5 — Search
+                    # Tab — Cases
+                    with gr.Tab("🗄 Cases"):
+                        gr.HTML("""
+                        <div style='font-size:0.8em; color:#64748b; padding:6px 0;'>
+                            Previously carved images. Reopening a case restores
+                            its artifacts without re-carving.
+                        </div>
+                        """)
+                        with gr.Row():
+                            cases_refresh_btn = gr.Button(
+                                "Refresh List", variant="secondary", scale=1
+                            )
+                            case_hash_box = gr.Textbox(
+                                placeholder="Image SHA-256 to reopen",
+                                show_label=False, scale=4, lines=1
+                            )
+                            case_open_btn = gr.Button(
+                                "Open Case", variant="primary", scale=1
+                            )
+                        cases_table = gr.Dataframe(interactive=False, wrap=True)
+                        with gr.Row():
+                            case_name_box = gr.Textbox(
+                                label="Case name", scale=2, lines=1
+                            )
+                            case_examiner_box = gr.Textbox(
+                                label="Examiner", scale=2, lines=1
+                            )
+                            case_save_btn = gr.Button(
+                                "Save Details", variant="secondary", scale=1
+                            )
+                        cases_status = gr.Markdown("")
+
+                    # Tab 5 — Leads (cross-artifact correlation)
+                    with gr.Tab("🔗 Leads"):
+                        gr.HTML("""
+                        <div style='font-size:0.8em; color:#64748b; padding:6px 0;'>
+                            Entities (users, USB serials, executables, domains)
+                            seen across more than one artifact type.
+                        </div>
+                        """)
+                        with gr.Row():
+                            leads_kind = gr.Dropdown(
+                                choices=["All", "user", "usb_serial",
+                                         "executable", "domain"],
+                                value="All", label="Entity type", scale=2
+                            )
+                            leads_btn = gr.Button(
+                                "Find Leads", variant="primary", scale=1
+                            )
+                        leads_table = gr.Dataframe(interactive=False, wrap=True)
+                        with gr.Row():
+                            pivot_entity_box = gr.Textbox(
+                                placeholder="Pivot on an entity "
+                                            "(e.g. billybob, nc.exe)",
+                                show_label=False, scale=4, lines=1
+                            )
+                            pivot_btn = gr.Button("Pivot", scale=1)
+                        pivot_table = gr.Dataframe(interactive=False, wrap=True)
+
+                    # Tab 6 — Search
                     with gr.Tab("🔎 Search"):
                         with gr.Row():
                             search_query = gr.Textbox(
@@ -601,6 +667,46 @@ def build_gui():
                        pd.DataFrame()
             return build_timeline(df, freq, artifact_type), activity_peaks(df)
 
+        def _open_case(image_hash, session):
+            image_hash = (image_hash or "").strip()
+            if not image_hash:
+                return "Enter an image SHA-256 from the table above.", "", ""
+            df, manifest = load_case(image_hash)
+            if df is None:
+                return f"No saved case found for `{image_hash}`.", "", ""
+
+            counts = df['ArtifactType'].str.lower().value_counts().to_dict()
+            counts["total"] = len(df)
+            _activate_case(session, df, image_hash, counts)
+            manifest = manifest or {}
+            return (
+                f"Opened **{manifest.get('case_name', image_hash[:12])}** — "
+                f"{len(df)} artifacts restored.",
+                manifest.get("case_name", ""),
+                manifest.get("examiner", ""),
+            )
+
+        def _save_case_details(name, examiner, session):
+            if session.image_hash_sha256 is None:
+                return "No case is currently open."
+            save_case(session.image_hash_sha256, session.current_audit_df,
+                      case_name=name or None, examiner=examiner or None,
+                      artifact_counts=session.artifact_counts)
+            return "Case details saved."
+
+        def _find_leads(kind, session):
+            if session.correlation_db is None:
+                return pd.DataFrame()
+            return top_entities(
+                session.correlation_db,
+                entity_type=None if kind == "All" else kind,
+            )
+
+        def _pivot(entity, session):
+            if session.correlation_db is None or not (entity or "").strip():
+                return pd.DataFrame()
+            return pivot_entity(session.correlation_db, entity)
+
         def _run_search(query, use_regex, artifact_type, session):
             hits, note = search_artifacts(
                 session.current_audit_df, query, use_regex, artifact_type
@@ -674,6 +780,32 @@ def build_gui():
             inputs=[timeline_freq, timeline_type, session_state],
             outputs=[timeline_plot, timeline_peaks]
         )
+        cases_refresh_btn.click(lambda: list_cases(), outputs=[cases_table])
+        case_open_btn.click(
+            _open_case,
+            inputs=[case_hash_box, session_state],
+            outputs=[cases_status, case_name_box, case_examiner_box]
+        ).then(
+            _after_upload,
+            inputs=[session_state],
+            outputs=[triage_output, timeline_type, search_type]
+        )
+        case_save_btn.click(
+            _save_case_details,
+            inputs=[case_name_box, case_examiner_box, session_state],
+            outputs=[cases_status]
+        ).then(lambda: list_cases(), outputs=[cases_table])
+        leads_btn.click(
+            _find_leads,
+            inputs=[leads_kind, session_state],
+            outputs=[leads_table]
+        )
+        for trigger in (pivot_btn.click, pivot_entity_box.submit):
+            trigger(
+                _pivot,
+                inputs=[pivot_entity_box, session_state],
+                outputs=[pivot_table]
+            )
         for trigger in (search_btn.click, search_query.submit):
             trigger(
                 _run_search,

@@ -2,6 +2,7 @@
 
 import threading
 
+
 class CaseSession:
     """Per-browser-session case state (one per Gradio gr.State instance)."""
     def __init__(self):
@@ -11,4 +12,5 @@ class CaseSession:
         self.artifact_counts = {}
         self.cached_system_facts = None
         self.session_log = []
+        self.correlation_db = None
         self.faiss_lock = threading.Lock()
