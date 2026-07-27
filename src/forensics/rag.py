@@ -13,6 +13,64 @@ from .config import CACHE_DIR
 ai_model = None
 _ai_model_lock = threading.Lock()
 
+# Bulk types are embedded into FAISS. FILESYSTEM is excluded: its MFT dump is far
+# too large and repetitive to embed usefully, and file-count questions are served
+# by extract_system_context() instead.
+EMBED_TYPES = {'EVTX', 'REGISTRY', 'SAM', 'SOFTWARE'}
+
+# High-value but low-volume artifacts (tens of rows, not tens of thousands).
+# Scanned lexically on every query rather than embedded: they are too rare to
+# ever win a pure vector search against 50k+ registry rows, and keeping them out
+# of the index means adding a type here never invalidates a built index.
+LEXICAL_TYPES = {
+    'USB', 'BROWSER', 'PREFETCH', 'RECYCLE', 'ACTIVITY', 'RECENT',
+    'COMMUNICATION', 'USN', 'SRUM',
+}
+
+# Maps investigator phrasing to the artifact types that actually answer it, so a
+# question about USB devices ranks 15 USB rows above 54k registry rows.
+TYPE_ROUTING = {
+    'USB':           [r'\busb\b', r'thumb ?drive', r'removable', r'external (drive|disk)', r'flash drive'],
+    'BROWSER':       [r'browser', r'\burls?\b', r'website', r'visit', r'bookmark', r'cookie', r'browsing', r'download'],
+    'SAM':           [r'user account', r'\busers?\b', r'\baccounts?\b', r'\blogons?\b', r'\blogins?\b'],
+    'SOFTWARE':      [r'install', r'program', r'software', r'application'],
+    'PREFETCH':      [r'prefetch', r'execut', r'\bran\b', r'launch'],
+    'RECYCLE':       [r'recycle', r'delet'],
+    'COMMUNICATION': [r'e-?mail', r'\bmail\b', r'outlook', r'\bpst\b', r'message'],
+    'RECENT':        [r'recent', r'\bopened\b', r'document'],
+    'ACTIVITY':      [r'\blnk\b', r'jump ?list', r'shortcut'],
+    'REGISTRY':      [r'registry', r'persistence', r'autostart', r'\brun ?key'],
+    'EVTX':          [r'event ?log', r'\bevtx\b', r'audit', r'security log', r'cleared'],
+}
+
+_STOPWORDS = {
+    'the', 'a', 'an', 'is', 'are', 'was', 'were', 'any', 'all', 'show', 'me',
+    'what', 'which', 'who', 'when', 'list', 'find', 'there', 'this', 'that',
+    'on', 'in', 'of', 'to', 'for', 'and', 'or', 'do', 'did', 'does', 'have',
+    'has', 'system', 'were', 'from', 'with', 'by', 'be',
+}
+
+
+def _dedup_shape(text):
+    """Structural fingerprint used to collapse near-identical artifact rows."""
+    t = text.lower()
+    t = re.sub(r'\{[0-9a-f\-]{36}\}', '<guid>', t)
+    t = re.sub(r'\d+', '#', t)
+    t = re.sub(r'[\\/]+', '/', t)
+    return t[:120]
+
+
+def _query_terms(query):
+    return {t for t in re.findall(r'[a-z0-9]+', query.lower())
+            if len(t) > 2 and t not in _STOPWORDS}
+
+
+def _routed_types(query):
+    q = query.lower()
+    return {t for t, pats in TYPE_ROUTING.items()
+            if any(re.search(p, q) for p in pats)}
+
+
 # ── FIX-3: Normalize text before embedding to maximize cache hit rate ─────
 def _normalize_for_embedding(txt: str) -> str:
     """Collapse volatile tokens so semantically identical events share one vector."""
@@ -29,14 +87,13 @@ def build_rag_context(query, session, top_k=8):
     if session.current_audit_df is None:
         return [], ""
 
-    # ── REQ-1 & REQ-2: Strict filtering — Activity-Based artifacts ONLY ──────
-    # FILESYSTEM (MFT) is completely excluded from FAISS embedding.
-    # File count questions are answered via extract_system_context() metadata.
-    EMBED_TYPES = {'EVTX', 'REGISTRY', 'SAM', 'SOFTWARE'}
+    types_upper = session.current_audit_df['ArtifactType'].astype(str).str.upper()
 
-    embed_mask = session.current_audit_df['ArtifactType'].str.upper().isin(EMBED_TYPES)
-    embed_df = session.current_audit_df[embed_mask].copy().reset_index(drop=True)
+    embed_df = session.current_audit_df[types_upper.isin(EMBED_TYPES)].copy()
     embed_df = embed_df.drop_duplicates(subset=['Task Category']).reset_index(drop=True)
+
+    lexical_df = session.current_audit_df[types_upper.isin(LEXICAL_TYPES)].copy()
+    lexical_df = lexical_df.drop_duplicates(subset=['Task Category']).reset_index(drop=True)
     # ─────────────────────────────────────────────────────────────────────────
 
     from sentence_transformers import SentenceTransformer
@@ -126,23 +183,51 @@ def build_rag_context(query, session, top_k=8):
     if query == "Init":
         return [], ""
 
-    # ── REQ-5: embed_df is always defined above the lock so search is safe ───
-    # Encode query — num_workers omitted for ST compatibility
+    # ── Hybrid retrieval ─────────────────────────────────────────────────────
+    # Vector search alone drowns rare-but-relevant artifacts (15 USB rows) under
+    # bulk registry noise, so semantic hits are merged with lexical hits and
+    # type-routed candidates, then rescored before truncating to top_k.
+    terms = _query_terms(query)
+    routed = _routed_types(query)
+
+    scored = []  # (score, source_df, positional_index)
+
     query_vec = ai_model.encode([query], convert_to_numpy=True)
+    n_semantic = min(max(top_k * 8, 40), len(embed_df))
     distances, result_indices = session.faiss_index.search(
-        np.array(query_vec).astype('float32'), k=top_k
+        np.array(query_vec).astype('float32'), k=n_semantic
     )
+    semantic_scores = {}
+    for dist, idx in zip(distances[0], result_indices[0]):
+        if 0 <= idx < len(embed_df):
+            semantic_scores[int(idx)] = 1.0 / (1.0 + float(dist))
+
+    scored.extend(
+        _score_frame(embed_df, semantic_scores, terms, routed, n_semantic)
+    )
+    scored.extend(
+        _score_frame(lexical_df, {}, terms, routed, n_semantic)
+    )
+
+    scored.sort(key=lambda item: item[0], reverse=True)
 
     relevant_rows = []
     context_lines = []
 
-    for rank, (dist, idx) in enumerate(zip(distances[0], result_indices[0])):
-        if idx < 0 or idx >= len(embed_df):
-            continue
-        row = embed_df.iloc[idx]
-        relevant_rows.append(row)
+    for score, frame, idx in scored[:top_k]:
+        row = frame.iloc[idx]
+        tag = f"E{len(relevant_rows) + 1}"
+        relevant_rows.append({
+            "tag": tag,
+            "time": str(row.get('Date and Time', 'N/A')),
+            "event_id": str(row.get('Event ID', 'N/A')),
+            "source": str(row.get('LogSource', 'N/A')),
+            "artifact_type": str(row.get('ArtifactType', 'N/A')),
+            "description": str(row.get('Task Category', 'N/A')),
+            "score": round(float(score), 4),
+        })
         context_lines.append(
-            f"[Evidence {rank}] "
+            f"[{tag}] "
             f"Time: {row.get('Date and Time', 'N/A')} | "
             f"EventID: {row.get('Event ID', 'N/A')} | "
             f"Source: {row.get('LogSource', 'N/A')} | "
@@ -150,3 +235,72 @@ def build_rag_context(query, session, top_k=8):
         )
 
     return relevant_rows, "\n".join(context_lines)
+
+
+def _score_frame(frame, semantic_scores, terms, routed, limit):
+    """Score candidate rows of one frame by semantic + lexical + type-routing."""
+    if frame is None or frame.empty:
+        return []
+
+    descriptions = frame['Task Category'].fillna('').astype(str).str.lower()
+    types_upper = frame['ArtifactType'].fillna('').astype(str).str.upper()
+
+    candidates = set(semantic_scores)
+
+    if terms:
+        hits = descriptions.apply(lambda d: sum(1 for t in terms if t in d))
+        candidates.update(int(i) for i in hits.nlargest(limit).index if hits[i] > 0)
+
+    if routed:
+        routed_positions = [i for i, t in enumerate(types_upper) if t in routed]
+        candidates.update(routed_positions[:limit])
+
+    results = []
+    seen_shapes = set()
+    for idx in candidates:
+        desc = descriptions.iat[idx]
+
+        # Collapse near-identical rows (e.g. thousands of CMI-CreateHive registry
+        # keys differing only by path) so one noisy family cannot fill top_k.
+        shape = _dedup_shape(desc)
+        if shape in seen_shapes:
+            continue
+        seen_shapes.add(shape)
+
+        lexical = (sum(1 for t in terms if t in desc) / len(terms)) if terms else 0.0
+        score = semantic_scores.get(idx, 0.0) + 0.5 * lexical
+
+        if routed:
+            # When the question clearly targets an artifact type, demote everything
+            # else: otherwise 50k semantically-similar registry rows bury the 15
+            # USB rows that actually answer it.
+            score = score + 0.35 if types_upper.iat[idx] in routed else score * 0.35
+
+        results.append((score, frame, idx))
+    return results
+
+
+def format_citations(rows, cited_only=True, answer_text=""):
+    """Render retrieved evidence as a markdown appendix for the chat/report."""
+    if not rows:
+        return ""
+
+    shown = rows
+    if cited_only and answer_text:
+        referenced = set(re.findall(r'\[(E\d+)\]', answer_text))
+        if referenced:
+            shown = [r for r in rows if r["tag"] in referenced]
+
+    if not shown:
+        return ""
+
+    lines = ["", "---", f"**Evidence ({len(shown)})**", ""]
+    for r in shown:
+        desc = r["description"]
+        if len(desc) > 240:
+            desc = desc[:240] + "…"
+        lines.append(
+            f"- **[{r['tag']}]** `{r['time']}` · {r['artifact_type']}/{r['source']} "
+            f"· Event {r['event_id']}  \n  {desc}"
+        )
+    return "\n".join(lines)

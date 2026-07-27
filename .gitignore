@@ -31,6 +31,9 @@ Thumbs.db
 src/metadata.pkl
 src/models/forensic_vdb.index
 
+# CI workflow: needs a PAT with `workflow` scope to push; add via GitHub UI
+.github/
+
 # Misc notes/scratch text
 notes.txt
 scratch.txt

@@ -1,6 +1,7 @@
 """LLM provider fallback chain: Ollama -> Groq -> Gemini -> offline summary."""
 
 import os
+import re
 import urllib.request
 
 from .context import extract_system_context
@@ -56,33 +57,32 @@ def ensure_llm_available():
     if gemini_client or groq_client or ollama_available:
         return
     raise RuntimeError(
-            "[ERROR] No LLM available. Either:\n"
-            "  • Set GEMINI_API_KEY in .env\n"
-            "  • Set GROQ_API_KEY in .env\n"
-            "  • Run: ollama serve"
-        )
-# ─────────────────────────────────────────────────────────────────────────
+        "[ERROR] No LLM available. Either:\n"
+        "  • Set GEMINI_API_KEY in .env\n"
+        "  • Set GROQ_API_KEY in .env\n"
+        "  • Run: ollama serve"
+    )
 
 
 def format_evidence_block(evidence_context, max_lines=5):
+    """Cite the tags of the top matches so the UI can resolve them to full evidence."""
     if not evidence_context:
         return ""
-    lines = [line.strip() for line in evidence_context.split("\n") if line.strip()]
-    lines = lines[:max_lines]
-    if not lines:
+    tags = re.findall(r'\[(E\d+)\]', evidence_context)[:max_lines]
+    if not tags:
         return ""
-    return "\n".join([f"- {line}" for line in lines])
+    return " ".join(f"[{t}]" for t in tags)
 
 
 def build_offline_response(user_question, evidence_context, session):
     system_facts = extract_system_context(session)
-    evidence_block = format_evidence_block(evidence_context)
-    if evidence_block:
-        evidence_block = f"\n\nEVIDENCE:\n{evidence_block}"
+    tags = format_evidence_block(evidence_context)
+    tag_line = f"\n\nTop matching evidence: {tags}" if tags else ""
     return (
-        "LLM unavailable. Returning deterministic summary.\n\n"
-        f"SYSTEM FACTS:\n{system_facts}"
-        f"{evidence_block}"
+        "*No LLM provider is currently reachable — showing a deterministic summary "
+        "instead of an AI analysis.*\n\n"
+        f"**System facts**\n```\n{system_facts}\n```"
+        f"{tag_line}"
     )
 
 
@@ -135,9 +135,13 @@ Analyze the provided evidence and answer the investigator's question clearly and
 FORMATTING RULES (STRICT):
 1. Write in clean professional prose. Use **bold** for key findings, usernames, timestamps, and suspicious items.
 2. Use bullet points only when listing multiple discrete items.
-3. DO NOT print raw evidence lines like "[Evidence 0] Time: ...". Never show evidence index numbers.
-4. DO NOT include a section called "EVIDENCE" with raw log lines.
-5. DO NOT include "USED_EVIDENCE: [...]" anywhere in your response.
+3. CITE YOUR SOURCES. Every factual claim drawn from the retrieved evidence must carry an
+   inline citation tag matching the evidence it came from, e.g. "the audit log was cleared at
+   **03:02** [E2]". Cite the specific tag(s) you used — never invent a tag that was not provided.
+4. If the retrieved evidence does not answer the question, say so plainly rather than guessing.
+   Facts taken from GLOBAL SYSTEM FACTS above need no citation tag.
+5. DO NOT paste raw evidence lines verbatim, and do not add your own "EVIDENCE" section —
+   the interface appends the cited evidence automatically below your answer.
 6. End with a short "**Key Finding:**" line summarizing the most important discovery.
 7. Keep responses under 180 words total."""
 

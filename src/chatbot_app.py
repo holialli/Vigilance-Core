@@ -20,7 +20,7 @@ from forensics.extractors import carve_evidence_from_image
 from forensics.llm import ensure_llm_available, query_llm
 from forensics.ml import engineer_features
 from forensics.parsers import compute_sha256
-from forensics.rag import build_rag_context
+from forensics.rag import build_rag_context, format_citations
 from forensics.reporting import generate_pdf_report
 from forensics.session import CaseSession
 
@@ -377,21 +377,21 @@ def build_gui():
                     clean_history.append(item)
 
             # RAG retrieval + LLM
-            _rows, context_text = build_rag_context(message, session)
+            rows, context_text = build_rag_context(message, session)
             bot_message = query_llm(message, context_text, session)
 
-            # Strip any raw evidence lines the LLM may still emit
-            bot_message = re.sub(
-                r'\n?EVIDENCE:\n(\-\s*\[Evidence\s*\d+\][^\n]*\n?)+',
-                '', bot_message
-            )
+            # Strip any raw evidence dumps the LLM may still emit (citation
+            # tags like [E1] are kept — they are resolved in the appendix).
             bot_message = re.sub(
                 r'\n?USED_EVIDENCE:\s*\[.*?\]', '', bot_message
             )
             bot_message = re.sub(
-                r'\n?\[Evidence\s*\d+\]\s*Time:[^\n]+', '', bot_message
+                r'\n?\[E\d+\]\s*Time:[^\n]+', '', bot_message
             )
             bot_message = bot_message.strip()
+
+            citations = format_citations(rows, answer_text=bot_message)
+            bot_message = bot_message + citations
 
             # Persist to session log for PDF report
             session.session_log.append({
