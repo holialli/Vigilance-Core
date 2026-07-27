@@ -14,6 +14,9 @@ from datetime import datetime
 import gradio as gr
 import pandas as pd
 
+from forensics.analysis import (activity_peaks, anomaly_overview, build_timeline,
+                                format_triage_markdown, search_artifacts,
+                                triage_findings)
 from forensics.config import CACHE_DIR, debug_extract
 from forensics.context import extract_system_context
 from forensics.extractors import carve_evidence_from_image
@@ -320,7 +323,61 @@ def build_gui():
                             """
                         )
 
-                    # Tab 3 — Raw Artifacts
+                    # Tab 3 — Triage
+                    with gr.Tab("🚨 Triage"):
+                        triage_btn = gr.Button(
+                            "🔄 Refresh Findings", variant="primary", size="sm"
+                        )
+                        triage_output = gr.Markdown(
+                            "Upload an image to see prioritised findings."
+                        )
+
+                    # Tab 4 — Timeline
+                    with gr.Tab("📈 Timeline"):
+                        with gr.Row():
+                            timeline_freq = gr.Radio(
+                                choices=[("Hourly", "h"), ("Daily", "D"),
+                                         ("Weekly", "W")],
+                                value="D", label="Bucket", scale=2
+                            )
+                            timeline_type = gr.Dropdown(
+                                choices=["All"], value="All",
+                                label="Artifact type", scale=2
+                            )
+                            timeline_btn = gr.Button(
+                                "Build Timeline", variant="primary", scale=1
+                            )
+                        timeline_plot = gr.BarPlot(
+                            x="Period", y="Count", color="ArtifactType",
+                            title="Artifact activity over time",
+                            height=340, x_label_angle=-45,
+                        )
+                        timeline_peaks = gr.Dataframe(
+                            label="Busiest days", interactive=False, wrap=True
+                        )
+
+                    # Tab 5 — Search
+                    with gr.Tab("🔎 Search"):
+                        with gr.Row():
+                            search_query = gr.Textbox(
+                                placeholder="Search all artifacts (e.g. jumpdrive, "
+                                            "kingston, .exe)",
+                                show_label=False, scale=5, lines=1
+                            )
+                            search_regex = gr.Checkbox(label="Regex", scale=1)
+                            search_type = gr.Dropdown(
+                                choices=["All"], value="All",
+                                label="Type", scale=2
+                            )
+                            search_btn = gr.Button(
+                                "Search", variant="primary", scale=1
+                            )
+                        search_status = gr.Markdown("")
+                        search_results = gr.Dataframe(
+                            interactive=False, wrap=True, elem_id="raw-artifacts"
+                        )
+
+                    # Tab 6 — Raw Artifacts
                     with gr.Tab("🗂 Raw Artifacts"):
                         with gr.Row():
                             artifacts_btn = gr.Button(
@@ -523,6 +580,33 @@ def build_gui():
 
             return stat_cards + full_panel
 
+        def _artifact_type_choices(session):
+            if session.current_audit_df is None:
+                return ["All"]
+            found = sorted(
+                session.current_audit_df['ArtifactType'].astype(str).str.upper().unique()
+            )
+            return ["All"] + found
+
+        def _refresh_triage(session):
+            df = session.current_audit_df
+            if df is None:
+                return "Upload an image to see prioritised findings."
+            return format_triage_markdown(triage_findings(df), anomaly_overview(df))
+
+        def _refresh_timeline(freq, artifact_type, session):
+            df = session.current_audit_df
+            if df is None:
+                return pd.DataFrame(columns=['Period', 'ArtifactType', 'Count']), \
+                       pd.DataFrame()
+            return build_timeline(df, freq, artifact_type), activity_peaks(df)
+
+        def _run_search(query, use_regex, artifact_type, session):
+            hits, note = search_artifacts(
+                session.current_audit_df, query, use_regex, artifact_type
+            )
+            return note, hits
+
         def _handle_report(inv_name, case_num, notes, session):
             """Wrapper — avoids variable name clash with msg textbox."""
             pdf_path, status_msg = generate_pdf_report(inv_name, case_num, notes, session)
@@ -531,10 +615,23 @@ def build_gui():
             return status_msg, None
 
         # ── WIRE EVENTS ───────────────────────────────────────────────────────
+        def _after_upload(session):
+            """Populate triage and type filters as soon as a case is carved."""
+            choices = _artifact_type_choices(session)
+            return (
+                _refresh_triage(session),
+                gr.update(choices=choices, value="All"),
+                gr.update(choices=choices, value="All"),
+            )
+
         upload_btn.click(
             handle_image_upload,
             inputs=[image_input, session_state],
             outputs=[status_box]
+        ).then(
+            _after_upload,
+            inputs=[session_state],
+            outputs=[triage_output, timeline_type, search_type]
         )
         msg.submit(
             respond,
@@ -567,6 +664,22 @@ def build_gui():
             inputs=[report_inv_name, report_case_num, report_notes, session_state],
             outputs=[report_status, report_file]
         )
+        triage_btn.click(
+            _refresh_triage,
+            inputs=[session_state],
+            outputs=[triage_output]
+        )
+        timeline_btn.click(
+            _refresh_timeline,
+            inputs=[timeline_freq, timeline_type, session_state],
+            outputs=[timeline_plot, timeline_peaks]
+        )
+        for trigger in (search_btn.click, search_query.submit):
+            trigger(
+                _run_search,
+                inputs=[search_query, search_regex, search_type, session_state],
+                outputs=[search_status, search_results]
+            )
 
     return demo, CSS
 
