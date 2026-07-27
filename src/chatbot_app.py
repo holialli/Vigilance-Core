@@ -1851,7 +1851,10 @@ def engineer_features(df):
             continue
         window_start = ts - timedelta(seconds=60)
         count = 0
-        for j in range(max(0, i - 50), i + 1):
+        # Lookback window (100 rows) must match isolation_model.py's training
+        # feature engineering, or EventsPerMinute will be systematically
+        # under-counted relative to what the model was fit on.
+        for j in range(max(0, i - 100), i + 1):
             ts_j = timestamps[j]
             if pd.notna(ts_j) and window_start <= ts_j <= ts:
                 count += 1
@@ -1864,7 +1867,10 @@ def engineer_features(df):
 
     def extract_eid(eid_raw):
         val = ''.join(filter(str.isdigit, str(eid_raw)))
-        return int(val) if val else 0
+        # -1 (not 0) for unparseable IDs: EventID 0 is a real heuristic
+        # threat ID ("Kernel Critical Event"), so defaulting to 0 here
+        # would falsely flag every row with a missing/blank Event ID.
+        return int(val) if val else -1
 
     df['EventID_Num'] = df['Event ID'].apply(extract_eid)
 
@@ -2075,7 +2081,7 @@ def extract_system_context():
     for desc in type_groups['SAM']['Task Category'].dropna():
         d_str = str(desc)
         name_match = re.search(r'SAM User Account:\s*(.+?)\s*\(', d_str)
-        logon_match = re.search(r'Logons:\s*(\d+)', d_str)
+        logon_match = re.search(r'Login Count:\s*(\d+)', d_str)
         if name_match:
             u_name = name_match.group(1).strip()
             sam_users.append(u_name)
@@ -2288,11 +2294,14 @@ def generate_pdf_report(inv_name, case_num, notes_text):
             Table, TableStyle, HRFlowable
         )
 
-        report_path = os.path.join(
-            SCRIPT_DIR, "cache",
-            f"ForensicReport_{case_num.replace(' ', '_')}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
+# Write to temp dir — guaranteed writable, Gradio can serve from here
+        report_filename = (
+            f"ForensicReport_{case_num.replace(' ', '_')}_"
+            f"{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
         )
-        os.makedirs(os.path.dirname(report_path), exist_ok=True)
+        report_dir = os.path.join(SCRIPT_DIR, "cache", "reports")
+        os.makedirs(report_dir, exist_ok=True)
+        report_path = os.path.join(report_dir, report_filename)
 
         doc = SimpleDocTemplate(
             report_path, pagesize=A4,
@@ -2488,13 +2497,21 @@ def generate_pdf_report(inv_name, case_num, notes_text):
         ))
 
         doc.build(story)
-        return report_path, f"✅ Report generated: {os.path.basename(report_path)}"
+
+        if not os.path.exists(report_path):
+            return None, "❌ PDF file was not created — unknown write error."
+        size_kb = os.path.getsize(report_path) / 1024
+        if size_kb < 1:
+            return None, "❌ PDF file is empty — ReportLab build failed silently."
+
+        print(f"  [REPORT] Generated: {report_path} ({size_kb:.1f} KB)")
+        return report_path, f"✅ Report ready — {os.path.basename(report_path)} ({size_kb:.1f} KB)"
 
     except ImportError:
         return None, "❌ ReportLab not installed. Run: pip install reportlab"
     except Exception as e:
         traceback.print_exc()
-        return None, f"❌ Report generation failed: {e}"
+        return None, f"❌ Report generation failed: {type(e).__name__}: {e}"
 
 def format_evidence_block(evidence_context, max_lines=5):
     if not evidence_context:
@@ -2532,7 +2549,7 @@ def query_ollama(prompt, system_prompt):
         "stream": False,
         "options": {
             "temperature": 0.1,
-            "num_predict": 400,   # max tokens in response
+            "num_predict": 400,   
         }
     }).encode("utf-8")
 
@@ -2582,7 +2599,7 @@ FORMATTING RULES (STRICT):
 
 ── YOUR FORENSIC ANALYSIS ──"""
 
-    # ── Priority 1: Ollama (local, unlimited) ─────────────────────────────
+    
     if ollama_available:
         result = query_ollama(prompt, system_prompt)
         if result:
@@ -2591,7 +2608,7 @@ FORMATTING RULES (STRICT):
         else:
             print("  [LLM] Ollama failed, falling back...")
 
-    # ── Priority 2: Groq (fast, generous free tier) ───────────────────────
+   
     if groq_client:
         try:
             chat_completion = groq_client.chat.completions.create(
@@ -2859,9 +2876,11 @@ def build_gui():
                         visible=True
                     )
                     report_file = gr.File(
-                        label="⬇ Download Report",
-                        visible=False
-                    )
+                    label="⬇ Download Report",
+                    visible=True,
+                    interactive=False,
+                    value=None
+                )
 
             # ── MAIN PANEL ───────────────────────────────────────────────────
             with gr.Column(scale=3, elem_classes="main-col"):
@@ -3125,8 +3144,8 @@ def build_gui():
             """Wrapper — avoids variable name clash with msg textbox."""
             pdf_path, status_msg = generate_pdf_report(inv_name, case_num, notes)
             if pdf_path and os.path.exists(pdf_path):
-                return status_msg, gr.update(value=pdf_path, visible=True)
-            return status_msg, gr.update(visible=False)
+                return status_msg, pdf_path   # Gradio 6: return path string directly
+            return status_msg, None
 
         # ── WIRE EVENTS ───────────────────────────────────────────────────────
         upload_btn.click(
