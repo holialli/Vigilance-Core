@@ -70,8 +70,10 @@ pycryptodome==3.23.0
 pydantic==2.13.3
 pydantic_core==2.46.3
 pydub==0.25.1
+pyflakes==3.2.0
 Pygments==2.20.0
 pyparsing==3.3.2
+pytest==9.1.1
 python-dateutil==2.9.0.post0
 python-dotenv==1.2.2
 python-evtx==0.8.1
