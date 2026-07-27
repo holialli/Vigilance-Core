@@ -7,7 +7,7 @@ scratch/
 
 # Data & Cache
 cache/
-data/
+/data/
 outputs/
 *.dd
 *.E01
@@ -25,13 +25,19 @@ Thumbs.db
 # Documentation
 *.pdf
 *.csv
-!src/data/*.csv # Keep necessary data if any (though user said no demo data)
+# Keep training data required to reproduce the Isolation Forest model
+!src/data/*.csv
 
 # Redundant legacy files
 src/metadata.pkl
 src/models/forensic_vdb.index
 
-
-*.txt
+# Misc notes/scratch text (requirements*.txt are intentionally NOT ignored)
+notes.txt
+scratch.txt
 run_audit.py
 ./scratch/
+
+Forensic_ROADMAP.md
+run_audit.py
+build_vector_index.py
