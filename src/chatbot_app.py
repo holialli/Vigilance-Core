@@ -47,19 +47,22 @@ load_dotenv(os.path.join(SCRIPT_DIR, ".env"))
 # SECTION 1: GLOBAL STATE
 # ═══════════════════════════════════════════════════════════════════════════
 
-current_audit_df = None
-faiss_index = None
-ai_model = None
-image_hash_sha256 = None
-artifact_counts = {}
-ml_alarm = None
-cached_system_facts = None
-debug_extract = True
+class CaseSession:
+    """Per-browser-session case state (one per Gradio gr.State instance)."""
+    def __init__(self):
+        self.current_audit_df = None
+        self.faiss_index = None
+        self.image_hash_sha256 = None
+        self.artifact_counts = {}
+        self.cached_system_facts = None
+        self.session_log = []
+        self.faiss_lock = threading.Lock()
 
-investigator_name = "Unknown Examiner"
-case_id = "CASE-2026-001"
-case_notes = ""
-session_log = []
+
+ai_model = None
+_ai_model_lock = threading.Lock()
+ml_alarm = None
+debug_extract = True
 db_conn = None
 
 MODEL_PATH = os.path.join(SCRIPT_DIR, "models", "forensic_alarm_v2.pkl")
@@ -1695,8 +1698,8 @@ def carve_evidence_from_image(image_source):
     """
     Open a forensic disk image with pytsk3 and extract ALL evidence.
     image_source: Can be a single string path or a list of strings.
+    Returns (dataframe, artifact_counts).
     """
-    global artifact_counts
     all_frames = []
     artifact_counts = {
         "evtx": 0, "registry": 0, "filesystem": 0,
@@ -1824,7 +1827,7 @@ def carve_evidence_from_image(image_source):
 
     result = pd.concat(all_frames, ignore_index=True)
     artifact_counts["total"] = len(result)
-    return result
+    return result, artifact_counts
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1904,8 +1907,6 @@ def get_anomaly_status(row):
 # SECTION 4: RAG / LLM
 # ═══════════════════════════════════════════════════════════════════════════
 
-faiss_lock = threading.Lock()
-
 # ── FIX-3: Normalize text before embedding to maximize cache hit rate ─────
 def _normalize_for_embedding(txt: str) -> str:
     """Collapse volatile tokens so semantically identical events share one vector."""
@@ -1916,10 +1917,10 @@ def _normalize_for_embedding(txt: str) -> str:
     txt = re.sub(r'([A-Za-z]:\\|/)[^\s|]+[\\/]', '<PATH>/', txt)
     return txt.strip()
 
-def build_rag_context(query, top_k=8):
-    global faiss_index, ai_model, image_hash_sha256
+def build_rag_context(query, session, top_k=8):
+    global ai_model
 
-    if current_audit_df is None:
+    if session.current_audit_df is None:
         return [], ""
 
     # ── REQ-1 & REQ-2: Strict filtering — Activity-Based artifacts ONLY ──────
@@ -1927,30 +1928,31 @@ def build_rag_context(query, top_k=8):
     # File count questions are answered via extract_system_context() metadata.
     EMBED_TYPES = {'EVTX', 'REGISTRY', 'SAM', 'SOFTWARE'}
 
-    embed_mask = current_audit_df['ArtifactType'].str.upper().isin(EMBED_TYPES)
-    embed_df = current_audit_df[embed_mask].copy().reset_index(drop=True)
+    embed_mask = session.current_audit_df['ArtifactType'].str.upper().isin(EMBED_TYPES)
+    embed_df = session.current_audit_df[embed_mask].copy().reset_index(drop=True)
     embed_df = embed_df.drop_duplicates(subset=['Task Category']).reset_index(drop=True)
     # ─────────────────────────────────────────────────────────────────────────
 
     from sentence_transformers import SentenceTransformer
 
-    with faiss_lock:
+    with _ai_model_lock:
         if ai_model is None:
             ai_model = SentenceTransformer('all-MiniLM-L6-v2')
 
-        if faiss_index is None:
+    with session.faiss_lock:
+        if session.faiss_index is None:
             cache_file = None
-            if image_hash_sha256:
-                case_dir = os.path.join(SCRIPT_DIR, "cache", image_hash_sha256)
+            if session.image_hash_sha256:
+                case_dir = os.path.join(SCRIPT_DIR, "cache", session.image_hash_sha256)
                 os.makedirs(case_dir, exist_ok=True)
                 cache_file = os.path.join(case_dir, "faiss.index")
 
             # ── REQ-4: Validate cache against filtered embed_df, not full df ─
             if cache_file and os.path.exists(cache_file):
-                print(f"  [FAISS] Loading cached index: {image_hash_sha256[:16]}...")
+                print(f"  [FAISS] Loading cached index: {session.image_hash_sha256[:16]}...")
                 loaded_index = faiss.read_index(cache_file)
                 if loaded_index.ntotal == len(embed_df):
-                    faiss_index = loaded_index
+                    session.faiss_index = loaded_index
                     print(f"  [FAISS] Cache valid ({loaded_index.ntotal} vectors).")
                 else:
                     print(
@@ -1958,10 +1960,10 @@ def build_rag_context(query, top_k=8):
                         f"({loaded_index.ntotal} cached vs {len(embed_df)} filtered). "
                         f"Rebuilding..."
                     )
-                    faiss_index = None
+                    session.faiss_index = None
             # ─────────────────────────────────────────────────────────────────
 
-            if faiss_index is None:
+            if session.faiss_index is None:
                 print(f"  [FAISS] Vectorizing {len(embed_df)} activity artifacts "
                       f"(EVTX + REGISTRY + SAM + SOFTWARE only)...")
                 t0 = time.time()
@@ -1994,24 +1996,24 @@ def build_rag_context(query, top_k=8):
                 if n_unique > ivf_threshold:
                     nlist = min(int(n_unique ** 0.5), 256)
                     quantizer = faiss.IndexFlatL2(dim)
-                    faiss_index = faiss.IndexIVFFlat(quantizer, dim, nlist)
-                    faiss_index.train(
+                    session.faiss_index = faiss.IndexIVFFlat(quantizer, dim, nlist)
+                    session.faiss_index.train(
                         np.array(unique_embeddings).astype('float32')
                     )
-                    faiss_index.nprobe = min(32, nlist)
+                    session.faiss_index.nprobe = min(32, nlist)
                     print(f"  [FAISS] Using IVF index (nlist={nlist})")
                 else:
-                    faiss_index = faiss.IndexFlatL2(dim)
+                    session.faiss_index = faiss.IndexFlatL2(dim)
                     print(f"  [FAISS] Using Flat L2 index")
                 # ─────────────────────────────────────────────────────────────
 
-                faiss_index.add(np.array(full_embeddings).astype('float32'))
+                session.faiss_index.add(np.array(full_embeddings).astype('float32'))
 
                 if cache_file:
-                    faiss.write_index(faiss_index, cache_file)
+                    faiss.write_index(session.faiss_index, cache_file)
 
                 elapsed = time.time() - t0
-                print(f"  [FAISS] Index ready — {faiss_index.ntotal} vectors "
+                print(f"  [FAISS] Index ready — {session.faiss_index.ntotal} vectors "
                       f"in {elapsed:.2f}s")
 
     # Return early if this was just an init/warmup call
@@ -2021,7 +2023,7 @@ def build_rag_context(query, top_k=8):
     # ── REQ-5: embed_df is always defined above the lock so search is safe ───
     # Encode query — num_workers omitted for ST compatibility
     query_vec = ai_model.encode([query], convert_to_numpy=True)
-    distances, result_indices = faiss_index.search(
+    distances, result_indices = session.faiss_index.search(
         np.array(query_vec).astype('float32'), k=top_k
     )
 
@@ -2044,12 +2046,11 @@ def build_rag_context(query, top_k=8):
     return relevant_rows, "\n".join(context_lines)
 
 
-def extract_system_context():
-    global current_audit_df
-    if current_audit_df is None or current_audit_df.empty:
+def extract_system_context(session):
+    if session.current_audit_df is None or session.current_audit_df.empty:
         return "No evidence loaded."
 
-    df = current_audit_df
+    df = session.current_audit_df
 
     start_time, end_time = "N/A", "N/A"
     hostname, os_version = "Unknown", "Unknown"
@@ -2269,9 +2270,9 @@ def extract_system_context():
         f"ANOMALIES: {anomaly_str}"
     )
 
-def generate_pdf_report(inv_name, case_num, notes_text):
+def generate_pdf_report(inv_name, case_num, notes_text, session):
     """Generate a professional forensic PDF report from the current session."""
-    if current_audit_df is None:
+    if session.current_audit_df is None:
         return None, "No forensic image loaded. Upload an image first."
 
     if not inv_name.strip():
@@ -2347,7 +2348,7 @@ def generate_pdf_report(inv_name, case_num, notes_text):
         )
 
         story = []
-        system_facts = extract_system_context()
+        system_facts = extract_system_context(session)
 
         # ── HEADER ────────────────────────────────────────────────────────────
         story.append(Paragraph("DIGITAL FORENSIC EXAMINATION REPORT", title_style))
@@ -2360,9 +2361,9 @@ def generate_pdf_report(inv_name, case_num, notes_text):
             ["Case Number",      case_num,
              "Report Generated", datetime.now().strftime('%Y-%m-%d %H:%M:%S')],
             ["Examiner",         inv_name,
-             "Image SHA-256",    (image_hash_sha256 or "N/A")[:32] + "..."],
+             "Image SHA-256",    (session.image_hash_sha256 or "N/A")[:32] + "..."],
             ["Classification",   "CONFIDENTIAL",
-             "Total Artifacts",  str(len(current_audit_df))],
+             "Total Artifacts",  str(len(session.current_audit_df))],
         ]
         meta_table = Table(meta_data, colWidths=[3.5*cm, 6*cm, 3.5*cm, 6*cm])
         meta_table.setStyle(TableStyle([
@@ -2410,13 +2411,13 @@ def generate_pdf_report(inv_name, case_num, notes_text):
         story.append(Spacer(1, 0.4*cm))
 
         # ── INVESTIGATION Q&A LOG ─────────────────────────────────────────────
-        if session_log:
+        if session.session_log:
             story.append(Paragraph("Investigation Query Log", heading_style))
             story.append(HRFlowable(width="100%", thickness=0.5,
                                     color=colors.HexColor('#cccccc')))
             story.append(Spacer(1, 0.2*cm))
 
-            for i, entry in enumerate(session_log, 1):
+            for i, entry in enumerate(session.session_log, 1):
                 story.append(Paragraph(
                     f"Query {i} — {entry.get('time', 'N/A')}",
                     subheading_style
@@ -2455,12 +2456,12 @@ def generate_pdf_report(inv_name, case_num, notes_text):
                                 color=colors.HexColor('#cccccc')))
         story.append(Spacer(1, 0.2*cm))
 
-        if artifact_counts:
+        if session.artifact_counts:
             counts_data = [["Artifact Type", "Count"]]
-            for k, v in artifact_counts.items():
+            for k, v in session.artifact_counts.items():
                 if k != "total":
                     counts_data.append([k.upper(), str(v)])
-            counts_data.append(["TOTAL", str(artifact_counts.get("total", len(current_audit_df)))])
+            counts_data.append(["TOTAL", str(session.artifact_counts.get("total", len(session.current_audit_df)))])
 
             counts_table = Table(counts_data, colWidths=[8*cm, 4*cm])
             counts_table.setStyle(TableStyle([
@@ -2518,8 +2519,8 @@ def format_evidence_block(evidence_context, max_lines=5):
     return "\n".join([f"- {line}" for line in lines])
 
 
-def build_offline_response(user_question, evidence_context):
-    system_facts = extract_system_context()
+def build_offline_response(user_question, evidence_context, session):
+    system_facts = extract_system_context(session)
     evidence_block = format_evidence_block(evidence_context)
     if evidence_block:
         evidence_block = f"\n\nEVIDENCE:\n{evidence_block}"
@@ -2562,14 +2563,12 @@ def query_ollama(prompt, system_prompt):
         print(f"  [OLLAMA] Query failed: {e}")
         return None
 
-def query_llm(user_question, evidence_context):
-    global cached_system_facts
-
-    if cached_system_facts is None:
+def query_llm(user_question, evidence_context, session):
+    if session.cached_system_facts is None:
         print("  [CACHE] Regenerating system facts...")
-        cached_system_facts = extract_system_context()
+        session.cached_system_facts = extract_system_context(session)
 
-    system_facts = cached_system_facts
+    system_facts = session.cached_system_facts
 
     system_prompt = f"""You are a Senior Digital Forensics Examiner writing a professional case report.
 Analyze the provided evidence and answer the investigator's question clearly and concisely.
@@ -2634,16 +2633,14 @@ FORMATTING RULES (STRICT):
 
     # ── Priority 4: Offline deterministic summary ─────────────────────────
     print("  [LLM] All providers failed — returning deterministic summary")
-    return build_offline_response(user_question, evidence_context)
+    return build_offline_response(user_question, evidence_context, session)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
 # SECTION 5: UPLOAD HANDLER & GUI
 # ═══════════════════════════════════════════════════════════════════════════
 
-def handle_image_upload(files):
-    global current_audit_df, image_hash_sha256, cached_system_facts, faiss_index
-
+def handle_image_upload(files, session):
     if not files:
         return "No files uploaded."
 
@@ -2656,17 +2653,18 @@ def handle_image_upload(files):
     artifact_path = os.path.join(case_dir, "artifacts.pkl")
 
     if os.path.exists(artifact_path):
-        current_audit_df = pd.read_pickle(artifact_path)
+        df = pd.read_pickle(artifact_path)
+        artifact_counts = df['ArtifactType'].str.lower().value_counts().to_dict()
+        artifact_counts["total"] = len(df)
         status_msg = (
-            f"Forensic Image Loaded: {len(current_audit_df)} artifacts recovered. "
+            f"Forensic Image Loaded: {len(df)} artifacts recovered. "
             f"SHA-256: {image_hash_sha256}"
         )
     else:
         print(f"  [IMAGE] Analyzing new forensic source...")
-        df = carve_evidence_from_image(filepaths)
+        df, artifact_counts = carve_evidence_from_image(filepaths)
         df = engineer_features(df)
         df.to_pickle(artifact_path)
-        current_audit_df = df
         status_msg = (
             f"Forensic Image Carved: {len(df)} artifacts identified. "
             f"SHA-256: {image_hash_sha256}"
@@ -2674,13 +2672,16 @@ def handle_image_upload(files):
 
     # ── REQ-6: Always reset state and trigger background index build ─────────
     # Applies to both fresh carves AND cache loads so repeated uploads work.
-    cached_system_facts = None
-    faiss_index = None  # Force index rebuild for new image
+    session.current_audit_df = df
+    session.image_hash_sha256 = image_hash_sha256
+    session.artifact_counts = artifact_counts
+    session.cached_system_facts = None
+    session.faiss_index = None  # Force index rebuild for new image
 
     def _background_index_build():
         try:
             print("  [FAISS] Background index build started...")
-            build_rag_context("Init")
+            build_rag_context("Init", session)
             print("  [FAISS] Background index build complete.")
         except Exception as e:
             print(f"  [FAISS] Background index build failed: {e}")
@@ -2779,6 +2780,7 @@ def build_gui():
 
     # ── Build the interface ───────────────────────────────────────────────────
     with gr.Blocks(title="VIGILANCE Forensic Engine") as demo:
+        session_state = gr.State(value=CaseSession)
 
         # ── Top banner ───────────────────────────────────────────────────────
         gr.HTML("""
@@ -2955,10 +2957,10 @@ def build_gui():
 
         # ── INNER CALLBACKS ───────────────────────────────────────────────────
 
-        def respond(message, history):
+        def respond(message, history, session):
             """Handle a chat query through RAG → LLM pipeline."""
             # Guard: no image loaded
-            if current_audit_df is None:
+            if session.current_audit_df is None:
                 reply = ("⚠️ No forensic image is loaded. "
                          "Please upload an image and carve artifacts first.")
                 history = list(history or [])
@@ -2967,7 +2969,7 @@ def build_gui():
                 return "", history
 
             # Guard: FAISS index still building
-            if faiss_index is None:
+            if session.faiss_index is None:
                 reply = ("⏳ The forensic index is still building in the background. "
                          "Please wait 15–30 seconds and try again.")
                 history = list(history or [])
@@ -2989,8 +2991,8 @@ def build_gui():
                     clean_history.append(item)
 
             # RAG retrieval + LLM
-            _rows, context_text = build_rag_context(message)
-            bot_message = query_llm(message, context_text)
+            _rows, context_text = build_rag_context(message, session)
+            bot_message = query_llm(message, context_text, session)
 
             # Strip any raw evidence lines the LLM may still emit
             bot_message = re.sub(
@@ -3006,7 +3008,7 @@ def build_gui():
             bot_message = bot_message.strip()
 
             # Persist to session log for PDF report
-            session_log.append({
+            session.session_log.append({
                 "question": message,
                 "answer":   bot_message,
                 "time":     datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
@@ -3016,9 +3018,9 @@ def build_gui():
             clean_history.append({"role": "assistant", "content": bot_message})
             return "", clean_history
 
-        def get_styled_summary():
+        def get_styled_summary(session):
             """Render the dashboard HTML summary panel."""
-            if current_audit_df is None:
+            if session.current_audit_df is None:
                 return """
                 <div style='text-align:center; padding:60px 20px; color:#475569;'>
                     <div style='font-size:2.5em; margin-bottom:12px;'>🖴</div>
@@ -3026,7 +3028,7 @@ def build_gui():
                 </div>
                 """
 
-            raw = extract_system_context()
+            raw = extract_system_context(session)
 
             # Safe key extraction with fallbacks
             def _extract(key, fallback="N/A"):
@@ -3135,9 +3137,9 @@ def build_gui():
 
             return stat_cards + full_panel
 
-        def _handle_report(inv_name, case_num, notes):
+        def _handle_report(inv_name, case_num, notes, session):
             """Wrapper — avoids variable name clash with msg textbox."""
-            pdf_path, status_msg = generate_pdf_report(inv_name, case_num, notes)
+            pdf_path, status_msg = generate_pdf_report(inv_name, case_num, notes, session)
             if pdf_path and os.path.exists(pdf_path):
                 return status_msg, pdf_path   # Gradio 6: return path string directly
             return status_msg, None
@@ -3145,36 +3147,38 @@ def build_gui():
         # ── WIRE EVENTS ───────────────────────────────────────────────────────
         upload_btn.click(
             handle_image_upload,
-            inputs=[image_input],
+            inputs=[image_input, session_state],
             outputs=[status_box]
         )
         msg.submit(
             respond,
-            inputs=[msg, chatbot],
+            inputs=[msg, chatbot, session_state],
             outputs=[msg, chatbot],
             show_progress="hidden"
         )
         submit_btn.click(
             respond,
-            inputs=[msg, chatbot],
+            inputs=[msg, chatbot, session_state],
             outputs=[msg, chatbot],
             show_progress="hidden"
         )
         refresh_btn.click(
             get_styled_summary,
+            inputs=[session_state],
             outputs=[summary_output]
         )
         artifacts_btn.click(
-            fn=lambda: (
-                current_audit_df
-                if current_audit_df is not None
+            fn=lambda session: (
+                session.current_audit_df
+                if session.current_audit_df is not None
                 else pd.DataFrame()
             ),
+            inputs=[session_state],
             outputs=[raw_dataframe]
         )
         report_btn.click(
             _handle_report,
-            inputs=[report_inv_name, report_case_num, report_notes],
+            inputs=[report_inv_name, report_case_num, report_notes, session_state],
             outputs=[report_status, report_file]
         )
 

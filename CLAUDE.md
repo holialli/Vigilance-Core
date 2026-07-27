@@ -52,10 +52,15 @@ Synthetic training data can be regenerated with `src/scripts/generate_demo_logs.
 
 `src/chatbot_app.py` is organized into five numbered sections (searchable via `# SECTION N:` header comments):
 
-1. **Global State** (~L47) — module-level singletons: `current_audit_df` (the working artifact DataFrame),
-   `faiss_index`, `ai_model` (SentenceTransformer), `ml_alarm` (loaded Isolation Forest), an in-memory SQLite
-   `db_conn` for cross-artifact correlation, and LLM client init for Gemini/Groq/Ollama (each optional,
-   checked independently; see "LLM fallback chain" below).
+1. **Global State** (~L47) — per-case state (`current_audit_df`, `faiss_index`, `image_hash_sha256`,
+   `artifact_counts`, `cached_system_facts`, `session_log`) lives on a `CaseSession` instance, one per
+   browser session via `gr.State(value=CaseSession)` — **not** module globals, so concurrent investigators
+   don't clobber each other's case. Functions that need it take a `session: CaseSession` parameter; every
+   Gradio event handler in `build_gui()` has `session_state` wired into its `inputs=[...]`. Truly shared,
+   read-only-after-startup singletons stay as real module globals: `ai_model` (SentenceTransformer, guarded
+   by `_ai_model_lock` on first load), `ml_alarm` (loaded Isolation Forest), an in-memory SQLite `db_conn`
+   (created but currently unused — a stub for future cross-artifact correlation), and the Gemini/Groq/Ollama
+   client init (each optional, checked independently; see "LLM fallback chain" below).
 2. **Forensic Image Parsing** (~L161–1828) — the extraction layer. `carve_evidence_from_image()` (~L1694)
    is the orchestrator: opens the image with `pytsk3` (raw) or `pyewf` via the custom `EWFImgInfo` adapter
    class (`.E01`), probes partition offsets, then fans out ~16 independent `extract_*`/`walk_filesystem`
@@ -70,8 +75,8 @@ Synthetic training data can be regenerated with `src/scripts/generate_demo_logs.
    (filesystem/MFT rows are deliberately excluded from the vector index — file-count questions are answered
    separately via `extract_system_context()` metadata) via `all-MiniLM-L6-v2`, builds/caches a FAISS index
    per image hash under `src/cache/<sha256>/faiss.index`, and returns top-k evidence for a query.
-   `query_llm()` builds a strict system prompt (grounded in `extract_system_context()` global facts) and
-   tries providers in order — see below. `generate_pdf_report()` renders a case report via `fpdf2`.
+   `query_llm()` builds a strict system prompt (grounded in `extract_system_context(session)`) and
+   tries providers in order — see below. `generate_pdf_report()` renders a case report via `reportlab`.
 5. **Upload Handler & GUI** (~L2641) — `handle_image_upload()` is the Gradio entry point: hashes the
    uploaded image (SHA-256), checks `src/cache/<sha256>/artifacts.pkl` for a prior carve of the same image
    before re-running extraction, then kicks off a background thread to warm the FAISS index. `build_gui()`
