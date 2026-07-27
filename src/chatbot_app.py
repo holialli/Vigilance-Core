@@ -1851,9 +1851,7 @@ def engineer_features(df):
             continue
         window_start = ts - timedelta(seconds=60)
         count = 0
-        # Lookback window (100 rows) must match isolation_model.py's training
-        # feature engineering, or EventsPerMinute will be systematically
-        # under-counted relative to what the model was fit on.
+        # must match isolation_model.py's training window
         for j in range(max(0, i - 100), i + 1):
             ts_j = timestamps[j]
             if pd.notna(ts_j) and window_start <= ts_j <= ts:
@@ -1867,10 +1865,7 @@ def engineer_features(df):
 
     def extract_eid(eid_raw):
         val = ''.join(filter(str.isdigit, str(eid_raw)))
-        # -1 (not 0) for unparseable IDs: EventID 0 is a real heuristic
-        # threat ID ("Kernel Critical Event"), so defaulting to 0 here
-        # would falsely flag every row with a missing/blank Event ID.
-        return int(val) if val else -1
+        return int(val) if val else -1  # 0 collides with a real heuristic threat ID
 
     df['EventID_Num'] = df['Event ID'].apply(extract_eid)
 

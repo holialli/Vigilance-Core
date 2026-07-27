@@ -25,14 +25,13 @@ Thumbs.db
 # Documentation
 *.pdf
 *.csv
-# Keep training data required to reproduce the Isolation Forest model
 !src/data/*.csv
 
 # Redundant legacy files
 src/metadata.pkl
 src/models/forensic_vdb.index
 
-# Misc notes/scratch text (requirements*.txt are intentionally NOT ignored)
+# Misc notes/scratch text
 notes.txt
 scratch.txt
 run_audit.py
