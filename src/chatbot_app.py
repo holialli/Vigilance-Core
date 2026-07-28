@@ -399,8 +399,10 @@ def build_gui():
                     with gr.Tab("🔗 Leads"):
                         gr.HTML("""
                         <div style='font-size:0.8em; color:#64748b; padding:6px 0;'>
-                            Entities (users, USB serials, executables, domains)
-                            seen across more than one artifact type.
+                            Entities pulled out of the evidence and cross-referenced.
+                            <b>All</b> shows only entities corroborated by more than
+                            one artifact type; picking a specific type lists every
+                            entity of that kind, including single-source ones.
                         </div>
                         """)
                         with gr.Row():

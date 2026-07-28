@@ -20,7 +20,11 @@ _ENTITY_PATTERNS = {
         re.compile(r'/Users/([^/]+)/', re.I),
     ],
     "usb_serial": [
+        # Registry USBSTOR form: "... Serial: I145291811100&0)"
         re.compile(r'Serial:\s*([A-Za-z0-9&_\-]+)', re.I),
+        # Device-attach form: "... (ID: VID_05DC&PID_0080\\I145291811100)".
+        # Requiring VID_/PID_ keeps hubs (ROOT_HUB\...) out.
+        re.compile(r'ID:\s*VID_[0-9A-F]{4}&PID_[0-9A-F]{4}\\([A-Za-z0-9&_\-]+)', re.I),
     ],
     "executable": [
         re.compile(r'([A-Za-z0-9_\-.]+\.(?:exe|dll|scr|bat|cmd|ps1|vbs))', re.I),
@@ -55,13 +59,29 @@ def init_correlation_db():
     return conn
 
 
+_USB_INSTANCE_SUFFIX = re.compile(r'&\d+$')
+
+
+def _normalize_entity(entity_type, value):
+    """Reduce the different spellings of one entity to a single key.
+
+    Windows records the same USB serial two ways — USBSTOR appends an instance
+    suffix ("I145291811100&0") that the device-attach record omits. Left
+    unnormalized the two never join, so a device seen in both places looks like
+    two single-source entities and is filtered out as an uncorroborated lead.
+    """
+    if entity_type == "usb_serial":
+        return _USB_INSTANCE_SUFFIX.sub('', value)
+    return value
+
+
 def extract_entities(description):
     """Pull identifiable entities out of one artifact description."""
     found = set()
     for entity_type, patterns in _ENTITY_PATTERNS.items():
         for pattern in patterns:
             for match in pattern.findall(description or ""):
-                value = match.strip().strip('\\/')
+                value = _normalize_entity(entity_type, match.strip().strip('\\/'))
                 if not value or len(value) < 3 or value.lower() in _NOISE:
                     continue
                 if value.endswith('$'):  # machine accounts
@@ -70,13 +90,23 @@ def extract_entities(description):
     return found
 
 
-def build_correlations(df, conn=None, max_rows=60000):
-    """Index entities from artifacts into a queryable correlation table."""
+def build_correlations(df, conn=None, max_rows=None):
+    """Index entities from artifacts into a queryable correlation table.
+
+    Indexes every row by default. A head() cap is not safe here: artifacts are
+    concatenated one extractor at a time, so truncating drops whole artifact
+    types rather than thinning the corpus evenly — on the reference image a
+    60k cap silently excluded all FILESYSTEM, DELETED, ACTIVITY and RECENT
+    rows, and most USB rows, from correlation.
+    """
     conn = conn or init_correlation_db()
     if df is None or df.empty:
         return conn
 
-    working = df.head(max_rows)
+    working = df if max_rows is None else df.head(max_rows)
+    if max_rows is not None and len(df) > max_rows:
+        print(f"  [CORRELATE] WARNING: capped at {max_rows} of {len(df)} rows — "
+              f"later artifact types are excluded.")
     rows = []
     for record in working.to_dict('records'):
         description = str(record.get('Task Category', ''))
@@ -100,8 +130,19 @@ def build_correlations(df, conn=None, max_rows=60000):
     return conn
 
 
-def top_entities(conn, entity_type=None, min_types=2, limit=25):
-    """Entities appearing across multiple artifact types — the strongest leads."""
+def top_entities(conn, entity_type=None, min_types=None, limit=25):
+    """Ranked leads for the Leads tab.
+
+    Unfiltered, a lead is only interesting if it is corroborated by more than
+    one artifact type, so the default is min_types=2. But some entity kinds
+    legitimately live in a single artifact type — a USB serial only ever
+    appears in USB rows — and requiring two sources made those categories
+    return nothing at all. When the caller names an entity_type they have
+    asked to see that category, so the corroboration requirement drops to 1.
+    """
+    if min_types is None:
+        min_types = 1 if entity_type else 2
+
     sql = """
         SELECT entity, entity_type,
                COUNT(*) AS refs,
@@ -123,18 +164,30 @@ def top_entities(conn, entity_type=None, min_types=2, limit=25):
 
     rows = conn.execute(sql, params).fetchall()
     return pd.DataFrame(rows, columns=['Entity', 'Type', 'References',
-                                       'ArtifactTypes', 'SeenIn'])
+                                       'TypeCount', 'ArtifactTypes'])
 
 
 def pivot_entity(conn, entity, limit=200):
-    """Every artifact mentioning one entity, for pivoting during an investigation."""
+    """Every artifact mentioning one entity, for pivoting during an investigation.
+
+    Identical descriptions are collapsed: a single registry key rewritten on
+    every boot produced 200 byte-identical rows, which filled the pane without
+    telling the examiner anything. Occurrences are counted instead, with the
+    first and last time each was seen.
+    """
     rows = conn.execute(
-        "SELECT timestamp, artifact_type, log_source, description "
-        "FROM correlations WHERE entity = ? ORDER BY timestamp LIMIT ?",
+        "SELECT MIN(timestamp), MAX(timestamp), artifact_type, log_source, "
+        "       MIN(description), COUNT(*) "
+        "FROM correlations WHERE entity = ? "
+        # Case-insensitive: the same path is recorded as both /Users/... and
+        # /USERS/..., which a case-sensitive GROUP BY keeps as separate rows.
+        "GROUP BY artifact_type, log_source, LOWER(description) "
+        "ORDER BY MIN(timestamp) LIMIT ?",
         (entity.lower().strip(), limit),
     ).fetchall()
     return pd.DataFrame(
-        rows, columns=['Date and Time', 'ArtifactType', 'LogSource', 'Description']
+        rows, columns=['First Seen', 'Last Seen', 'ArtifactType',
+                       'LogSource', 'Description', 'Occurrences']
     )
 
 
