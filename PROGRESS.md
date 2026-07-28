@@ -2,15 +2,48 @@
 
 Working notes for continuing this project. Last updated after the extraction-integrity pass.
 
-Repo: `holialli/Vigilance-Core` (branch `main`). 99 tests passing (`python -m pytest tests/ -q`).
+Repo: `holialli/Vigilance-Core` (branch `main`). 122 tests passing (`python -m pytest tests/ -q`).
 
 **Goal:** conversational forensics — an investigator asks questions in natural language
 instead of manually hunting through artifacts. Not trying to match Autopsy's parser
 coverage; competing on the AI/triage layer Autopsy doesn't have.
 
-> **4 commits are local and unpushed** (`238942d`, `e367efb`, `86e0674`, `6594994`).
-> Push was declined this session. Use a transient auth header with `GITHUB_TOKEN`
-> from `src/.env`; never write it to git config.
+> Push with a transient auth header built from `GITHUB_TOKEN` in `src/.env`
+> (`git -c http.extraheader=...`); never write it to git config.
+
+---
+
+## External validation (NIST CFReDS "Hacking Case")
+
+The strongest evidence the tool works, because the ground truth is not ours.
+`https://cfreds-archive.nist.gov/Hacking_Case.html` publishes a Windows XP
+image **and an answer key** (`TestAnswers.pdf`, 31 questions). Both segments
+(`.E01` + `.E02`, 4.87 GB decoded) sit gitignored in the repo root.
+
+| Q | NIST answer | Result |
+|---|---|---|
+| 1 / 1b | MD5 `AEE4FCD9301C03B3B054623CA261959A` | **PASS** — exact, and matches the hash stored in the E01 |
+| 2 | Windows XP | **PASS** — `OS: Microsoft Windows XP` |
+| 6 | `N-1A9ODN6ZXK4LQ` | **PASS** — surfaced as `HOST:` |
+| 9 | 5 accounts | **PASS** — incl. `Mr. Evil` |
+| 10 / 11 | Mr. Evil | **PASS** |
+| 16 | 6 hacking tools | **PASS** — 7/7 found (Ethereal and NetStumbler via prefetch) |
+| 28 | 4 executables in recycle bin | **PASS** — after implementing INFO2 parsing |
+| 3, 5, 7 | install date, owner, domain | pass, but *recoverable by search* rather than surfaced |
+| 30 | 3 files deleted | **not scored** — NIST counts what the recycle bin reports; `DELETED` counts unallocated MFT + `$OrphanFiles`. Different measures. |
+| 12-15, 17-27, 29, 31 | mail/IRC config, packet capture, AV | **out of scope** — capabilities this tool does not claim |
+
+Re-run with the harness in the session scratchpad (`validate_nist.py`).
+
+**Three bugs this image found that the local Windows 7 image never could:**
+- Multi-segment E01 sets were **entirely unopenable** (`8a62634`).
+- `.E02` was not gitignored (`ed8be04`).
+- XP's `INFO2` recycle bin was never parsed (`92a5b16`).
+
+**Write the checks strictly.** The first version of this harness scored Q28 and
+Q30 as `len(...) > 0`, which passes on any non-zero result — it reported 12/12
+while Q28 was really 2-vs-4 and Q30 was 27-vs-3. A validator that grades itself
+leniently is worse than none.
 
 ---
 
@@ -24,7 +57,7 @@ Real evidence used throughout (both gitignored, sitting in the repo root):
   opened. Errors out correctly via the existing "Split E01 Image Detected" guard.
   Not a bug; get the remaining segments if you want to use it.
 
-Carve is slow — **~19 min threaded (lossy), 2h0m serial (correct)**. Background it.
+Carve is slow. Background it and redirect output. Timings: see 'Concurrency' below.
 Scratch scripts used this session (re-create as needed): a carve-and-pickle
 runner, an EVTX-only runner, and a citation end-to-end harness.
 
@@ -62,7 +95,7 @@ src/forensics/
   config.py       paths, HEURISTIC_THREAT_IDS, hashset paths
   session.py      CaseSession
   parsers.py      EVTX, registry hive, SHA-256, EWFImgInfo
-  extractors.py   all extract_*, walk_filesystem, carve orchestrator  (~1730 lines)
+  extractors.py   all extract_*, walk_filesystem, carve orchestrator  (~1780 lines)
   ml.py           engineer_features, lazy model load
   rag.py          hybrid retrieval + citations
   context.py      extract_system_context
@@ -73,6 +106,7 @@ src/forensics/
   cases.py        save/load/list cases
   shimcache.py    AppCompatCache parser
   hashsets.py     hashing + known-good/bad matching
+  recyclebin.py   INFO2 (XP) and $I (Vista+) record parsers
 ```
 
 ### Evidence citations + RAG overhaul (`42d95b6`)
@@ -91,7 +125,9 @@ src/forensics/
 - **ShimCache**: was a permanent no-op stub; now a real AppCompatCache parser
   recovering **492 execution records** (Win7 x64 pads 4 bytes after the length
   WORDs — without that the parser returns 0).
-- **Deleted/orphaned files**: **1,334 recovered** via TSK unalloc flags + `$OrphanFiles`.
+- **Deleted/orphaned files**: recovered via TSK unalloc flags + `$OrphanFiles`.
+  Originally reported as "1,334 recovered" — **that was wrong**, see the
+  double-counting fix below. The true figure on this image is **663**.
 - **Hash sets** (`hashsets.py`): MD5+SHA-256 in one pass, NSRL-style loader.
   Skipped when no sets configured — it added ~22 min for zero benefit.
 - **Correlation engine** + **Leads** tab; **Case management** + **Cases** tab.
@@ -187,10 +223,30 @@ semantics; **4 of its 5 tests fail against the previous code.**
 
 ## Left to do
 
+### 0. Corrections to figures previously reported here
+
+Three numbers in earlier versions of this document were wrong. They are
+corrected in place above; recorded here so the same mistakes are not repeated.
+
+- **"1,334 deleted files recovered" → 663.** `walk_filesystem` walked `/Users`,
+  `/USERS`, `/` and `/$OrphanFiles` as overlapping roots — TSK resolves the case
+  variants to one directory and `/` covers the rest — recording the same file up
+  to four times. FILESYSTEM was inflated 2.8x, DELETED 2.0x. A row count was
+  reported as an artifact count without ever checking distinctness.
+- **"recycle bin 4 → 32" → 4 → 29.** Three of the 32 were `$Reparse`,
+  `$RmMetadata` and `$Repair` — NTFS metafiles caught by a loose `^\$R` pattern,
+  presented as deleted user data.
+- **"BROWSER is 0 because the image is IE-era index.dat"** — wrong; it was the
+  truncated discovery walk hiding a Firefox profile. Already corrected above.
+
+The pattern in all three: a number was quoted from a row count or a single
+observation without a second, independent check. Prefer distinct counts, and
+prefer an external reference image over self-assessment.
+
 ### 1. Concurrency still corrupts libtsk (highest priority)
 Per-task FS handles (`open_fs()` / `isolated()` in `extractors.py`) fixed the
 *worst* of it — BROWSER, COMMUNICATION, PREFETCH and RECYCLE all come back, and
-EXECUTION (492) / DELETED (1,334) are stable. **But it is not fully fixed.**
+EXECUTION (492) / DELETED (663 distinct) are stable. **But it is not fully fixed.**
 
 With error reporting now in place, a 14-worker carve visibly fails with
 `$IDX_ROOT not found` on `System.evtx`, `GroupPolicy`, `WindowsUpdateClient` and
@@ -199,25 +255,25 @@ With error reporting now in place, a 14-worker carve visibly fails with
 event-log evidence, lost nondeterministically.
 
 `CARVE_MAX_WORKERS` was added so a carve can be made reproducible (`1` = serial).
-**Serial is correct but not shippable as the default: it took 7,194s (2h0m)**
-against ~19 min threaded. Measured, not estimated.
+Serial was 7,194s (2h0m) against ~19 min threaded — but that measurement predates
+the shared path index.
 
-The slowness is not just the lost parallelism — it exposed a design flaw.
-`heuristic_discover_files` does a full recursive traversal of the image, and it
-is called **independently by RECYCLE, BROWSER, COMMUNICATION and SRUM**: four
-complete walks of the same 300 MB image where one would do. That was cheap while
-the walk was truncating early (i.e. while it was broken) and dominates the carve
-now that it is correct.
+**Step 1 is done** (`693ac74`). `heuristic_discover_files` used to walk the whole
+image per call, with four extractors calling it. `build_path_index()` now walks
+once and every caller filters:
 
-**Next step, in order:**
-1. **Collapse the four traversals into one.** Walk once, match every pattern set
-   against that single listing. Correctness-neutral and the biggest win — it may
-   make threading unnecessary, or at least make the next step cheap to validate.
-2. Then re-measure threaded. If `$IDX_ROOT` corruption persists, move to
-   `ProcessPoolExecutor` for true isolation (libtsk keeps process-global state,
-   which is why per-thread handles could not fix it). The task closures
-   (`isolated(fn)`) aren't picklable, so this needs module-level workers taking
-   `(task_name, image_path, offset)`.
+    per-caller walks  4,053.7s   ->   shared index  1,157.6s   (3.5x)
+
+**Step 2 is still open: re-measure a threaded carve and pick the default.**
+Discovery was 4,053s of the 7,194s serial total, so serial should now land near
+~70 min — possibly close enough to threaded that serial becomes shippable, which
+would resolve the corruption problem outright. Measure before deciding.
+
+If threading is still needed and `$IDX_ROOT` corruption persists, move to
+`ProcessPoolExecutor` for true isolation (libtsk keeps process-global state,
+which is why per-thread handles could not fix it). The task closures
+(`isolated(fn)`) aren't picklable, so this needs module-level workers taking
+`(task_name, image_path, offset)`.
 
 ### 2. Promote the good carve into the cache
 `src/cache/<sha256>/artifacts.pkl` still holds the **old racy carve** (80,554
@@ -252,8 +308,15 @@ model and keeping only the heuristic Event-ID rules, which *do* work.
 have no hive. Only `Jimmy Wilson` does. Don't chase this.
 
 ### 7. Smaller items
-- `extractors.py` is ~1730 lines — split per artifact family.
+- `extractors.py` is ~1780 lines — split per artifact family.
 - Prefetch parsing reads only filenames/timestamps — no run counts from the `.pf` body.
+- **EVTX extraction is Vista+ only.** Windows XP writes `.evt` (not `.evtx`) to
+  `%SystemRoot%\system32\config\`, so the NIST XP image yields 0 event-log rows.
+  Registry, SAM, prefetch and recycle bin all work on XP; only the event log
+  does not. Add a `.evt` parser if XP support matters.
+- `$R` recycle files carry no metadata of their own — the paired `$I` record
+  names them. They are still listed individually, so a deleted item can appear
+  twice (once named from `$I`, once as a bare `$R`). Consider pairing them.
 - Leads ranking still puts `svchost.exe` on top; ubiquitous system binaries
   satisfy the 2-source rule trivially. Ranking is a judgement call, left alone.
 - No hash sets shipped; consider documenting where to get NSRL.
@@ -266,6 +329,12 @@ have no hive. Only `Jimmy Wilson` does. Don't chase this.
   deeply nested evidence vanish, and deeply nested is often the most
   incriminating (the Firefox history here was 6 levels down). If an extractor
   returns suspiciously few artifacts, suspect the traversal before the parser.
+- **Validate against someone else's ground truth.** Every self-assessment in
+  this project has been too generous. The NIST image found three bugs in one
+  evening that months of testing against `Image.E01` never surfaced, because a
+  single test image only exercises the paths that image happens to use.
+- **Count distinct things, not rows.** Two inflated figures shipped here because
+  `len(df)` was reported as an artifact count.
 - **Don't trust a clean run.** Nearly every bug here only appeared against the
   real E01 — ShimCache padding, mixed timezones, triage false positives, the
   thread race, the iteration truncation. Unit tests passed the whole time.
