@@ -45,7 +45,7 @@ def extract_system_context(session):
     sam_users_str = (f"{len(sam_users)} accounts: {', '.join(sam_users)}"
                      if sam_users else "None found")
 
-    usb_devices, run_keys = [], []
+    run_keys = []
     av_disabled = False
 
     reg_df = type_groups['REGISTRY']
@@ -56,8 +56,6 @@ def extract_system_context(session):
             hostname = desc.split("=")[-1].strip()
         elif "currentversion\\productname =" in d_lower:
             os_version = desc.split("=")[-1].strip()
-        elif "usbstor" in d_lower or "enum\\usb" in d_lower:
-            usb_devices.append(desc.split("\\")[-1])
         elif "currentversion\\run" in d_lower:
             run_keys.append(desc.split("\\")[-1])
         elif "disableantispyware" in d_lower and "= 1" in d_lower:
@@ -70,8 +68,12 @@ def extract_system_context(session):
             if match:
                 os_version = match.group(1).strip()
 
-    usb_str = ", ".join(set([u for u in usb_devices if len(u) > 3][:5])) if usb_devices else "None"
-    run_str = ", ".join(set([r for r in run_keys if len(r) > 3][:5])) if run_keys else "None"
+    # Autostart entries are a first-order persistence indicator, so they belong
+    # in the grounding facts. Deduplicate before truncating — slicing first
+    # yields fewer than the intended number of distinct entries.
+    unique_runs = list(dict.fromkeys(r for r in run_keys if len(r) > 3))
+    run_str = (f"{len(unique_runs)} entries: {', '.join(unique_runs[:8])}"
+               if unique_runs else "None")
 
     file_stats_str = "No filesystem data"
     fs_df = type_groups['FILESYSTEM']
@@ -217,7 +219,8 @@ def extract_system_context(session):
         f"HOST: {hostname} | OS: {os_version}\nALERTS: {alerts_str}\n"
         f"SAM USERS: {sam_users_str}\nPROFILES: {user_list}\n"
         f"ACTIVE USERS: {active_users_str}\nFILESYSTEM: {file_stats_str}\n"
-        f"PROGRAMS: {programs_str}\nPREFETCH: {prefetch_str}\n"
+        f"PROGRAMS: {programs_str}\nAUTOSTART (Run keys): {run_str}\n"
+        f"PREFETCH: {prefetch_str}\n"
         f"RECENT PROGRAMS: {recent_programs_str}\n"
         f"USB DEVICES ({usb_count}): {usb_list}\n"
         f"WEB ACTIVITY: {search_count} searches, {bookmark_count} bookmarks, "
