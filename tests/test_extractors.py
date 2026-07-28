@@ -168,6 +168,127 @@ def test_discovery_walks_all_siblings_not_just_the_first():
     ]
 
 
+def _deep_tree():
+    """A tree with the Firefox profile at the depth that was being truncated."""
+    return {
+        "/": [_Entry("Users", type_=2), _Entry("$Recycle.Bin", type_=2)],
+        "/Users": [_Entry("jimmy", type_=2)],
+        "/Users/jimmy": [_Entry("AppData", type_=2), _Entry("Cookies")],
+        "/Users/jimmy/AppData": [_Entry("Roaming", type_=2)],
+        "/Users/jimmy/AppData/Roaming": [_Entry("Mozilla", type_=2)],
+        "/Users/jimmy/AppData/Roaming/Mozilla": [_Entry("Firefox", type_=2)],
+        "/Users/jimmy/AppData/Roaming/Mozilla/Firefox": [_Entry("Profiles", type_=2)],
+        "/Users/jimmy/AppData/Roaming/Mozilla/Firefox/Profiles": [
+            _Entry("8pp14cbi.default", type_=2),
+        ],
+        "/Users/jimmy/AppData/Roaming/Mozilla/Firefox/Profiles/8pp14cbi.default": [
+            _Entry("places.sqlite"),
+        ],
+        "/$Recycle.Bin": [_Entry("S-1-5-21-1001", type_=2)],
+        "/$Recycle.Bin/S-1-5-21-1001": [_Entry("$IABCDEF.txt"), _Entry("$RABCDEF.txt")],
+    }
+
+
+def test_shared_index_matches_a_direct_walk():
+    """The shared index must find exactly what walking per-caller found."""
+    patterns = [r'^places\.sqlite$', r'^Cookies$']
+
+    walked = extractors.heuristic_discover_files(
+        FakeFS(_deep_tree()), patterns, max_depth=14)
+
+    fs = FakeFS(_deep_tree())
+    index = extractors.build_path_index(fs, max_depth=14)
+    filtered = extractors.heuristic_discover_files(
+        fs, patterns, max_depth=14, index=index)
+
+    assert sorted(walked) == sorted(filtered)
+    assert "/Users/jimmy/AppData/Roaming/Mozilla/Firefox/Profiles/" \
+           "8pp14cbi.default/places.sqlite" in filtered
+
+
+def test_index_is_built_from_exactly_one_traversal():
+    """The whole point: four callers, one walk."""
+    fs = FakeFS(_deep_tree())
+    index = extractors.build_path_index(fs, max_depth=14)
+    walks_for_index = fs.access_count
+
+    for patterns in ([r'^\$I'], [r'^Cookies$'], [r'^.*\.eml$'], [r'^SRUDB\.dat$']):
+        extractors.heuristic_discover_files(fs, patterns, max_depth=14, index=index)
+
+    # Filtering four times must not touch the filesystem at all.
+    assert fs.access_count == walks_for_index
+
+
+def test_index_reaches_recycle_bin_contents():
+    """$Recycle.Bin is skipped by the per-call walk but must be in the index."""
+    fs = FakeFS(_deep_tree())
+    index = extractors.build_path_index(fs, max_depth=14)
+
+    hits = extractors.heuristic_discover_files(
+        fs, [r'^\$I', r'^\$R'], max_depth=14, index=index)
+
+    assert "/$Recycle.Bin/S-1-5-21-1001/$IABCDEF.txt" in hits
+    assert "/$Recycle.Bin/S-1-5-21-1001/$RABCDEF.txt" in hits
+
+
+@pytest.mark.parametrize("max_depth", [0, 1, 2, 3, 4, 6, 10, 14])
+def test_index_depth_cutoff_matches_the_walk(max_depth):
+    """Caught a real off-by-one: the filter was one level shallower than the walk."""
+    tree = {
+        "/": [_Entry("a", type_=2)],
+        "/a": [_Entry("b", type_=2)],
+        "/a/b": [_Entry("c", type_=2)],
+        "/a/b/c": [_Entry("d.txt")],
+    }
+    patterns = [r'^a$', r'^b$', r'^c$', r'^d\.txt$']
+
+    walked = sorted(extractors.heuristic_discover_files(
+        FakeFS(tree), patterns, max_depth=max_depth))
+
+    fs = FakeFS(tree)
+    index = extractors.build_path_index(fs, max_depth=14)
+    filtered = sorted(extractors.heuristic_discover_files(
+        fs, patterns, max_depth=max_depth, index=index))
+
+    assert walked == filtered
+
+
+def test_index_respects_start_path_and_depth():
+    fs = FakeFS(_deep_tree())
+    index = extractors.build_path_index(fs, max_depth=14)
+
+    scoped = extractors.heuristic_discover_files(
+        fs, [r'^places\.sqlite$'], start_path="/$Recycle.Bin",
+        max_depth=14, index=index)
+    assert scoped == []
+
+    too_shallow = extractors.heuristic_discover_files(
+        fs, [r'^places\.sqlite$'], max_depth=3, index=index)
+    assert too_shallow == []
+
+
+def test_filesystem_walk_does_not_double_count_overlapping_roots():
+    """'/Users' and '/USERS' resolve to the same directory; '/' reaches both.
+
+    Without dedup the same file is recorded two to four times, which inflated
+    the reference image's deleted-file count from 663 to 1,334.
+    """
+    shared = [_Entry("secret.doc"), _Entry("notes.txt")]
+    tree = {
+        "/": [_Entry("Users", type_=2), _Entry("$OrphanFiles", type_=2)],
+        "/Users": shared,
+        "/USERS": shared,            # same directory, different spelling
+        "/$OrphanFiles": [_Entry("deleted.bin")],
+    }
+
+    frame = extractors.walk_filesystem(FakeFS(tree), limit=1000, max_depth=5)
+
+    paths = [p.lower() for p in frame["_filepath"]]
+    assert len(paths) == len(set(paths)), f"duplicate paths recorded: {paths}"
+    assert paths.count("/users/secret.doc") == 1
+    assert paths.count("/$orphanfiles/deleted.bin") == 1
+
+
 def test_filesystem_walk_indexes_siblings_after_a_subdirectory():
     """walk_filesystem recursed mid-iteration, so siblings after a dir vanished."""
     fs = FakeFS({

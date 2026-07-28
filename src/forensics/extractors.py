@@ -6,6 +6,7 @@ import os
 import re
 import sqlite3
 import tempfile
+import time
 import traceback
 from datetime import datetime, timedelta, timezone
 
@@ -80,16 +81,116 @@ _SKIP_DIRS_LOWER = {
     'windows.old',
 }
 
+# Only these are worth skipping when the walk is shared. They are enormous and
+# no extractor looks inside them. The recycle-bin directories are deliberately
+# absent: extract_recycle_bin searches for the $I/$R files that live inside
+# them, and skipping them forced it down a second-pass fallback.
+_INDEX_SKIP_DIRS_LOWER = {'winsxs', 'servicing', 'driverstore', 'windows.old'}
+
+_WALK_SKIP_NAMES = {'.', '..', '$orphanfiles'}
+
+
+def build_path_index(fs, start_path="/", max_depth=14):
+    """Walk the image once and record every path found.
+
+    heuristic_discover_files traverses the whole filesystem per call, and four
+    extractors call it (recycle bin, browser, communication, SRUM) — six or more
+    complete walks of the same image per carve. That was cheap only while the
+    walk was truncating early; once it descended properly it dominated carve
+    time. Build the listing once here and let every caller filter it.
+
+    Returns a list of (full_path, name, is_dir, depth).
+    """
+    index = []
+
+    def _walk(path, depth):
+        if depth > max_depth:
+            return
+        try:
+            directory = fs.open_dir(path)
+            if directory is None:
+                return
+        except Exception:
+            return
+
+        entries = []
+        for entry in directory:
+            try:
+                raw_name = entry.info.name.name
+                name = (raw_name.decode('utf-8', errors='ignore')
+                        if isinstance(raw_name, bytes) else raw_name)
+                if name.lower() in _WALK_SKIP_NAMES:
+                    continue
+                ntype = entry.info.name.type if entry.info.name else 0
+                meta_type = (entry.info.meta.type
+                             if entry.info.meta is not None else 0)
+                entries.append((name, ntype, meta_type))
+            except Exception:
+                continue
+
+        for name, ntype, meta_type in list(dict.fromkeys(entries)):
+            try:
+                full_path = f"{path}/{name}" if path != "/" else f"/{name}"
+                is_dir = (ntype == 2) or (meta_type == 2)
+                if not is_dir and ntype not in (1, 2):
+                    try:
+                        fs.open_dir(full_path)
+                        is_dir = True
+                    except Exception:
+                        is_dir = False
+
+                index.append((full_path, name, is_dir, depth + 1))
+
+                if is_dir and name.lower() not in _INDEX_SKIP_DIRS_LOWER:
+                    _walk(full_path, depth + 1)
+            except Exception:
+                continue
+
+    _walk(start_path, 0)
+    print(f"  [INDEX] Indexed {len(index)} paths in a single traversal.")
+    return index
+
+
+def match_path_index(index, target_patterns, start_path="/", max_depth=6):
+    """Select paths from a prebuilt index, mirroring a heuristic walk."""
+    compiled = [re.compile(p, re.IGNORECASE) for p in target_patterns]
+    if start_path == "/":
+        prefix, base_depth = "/", 0
+    else:
+        prefix = start_path.rstrip("/") + "/"
+        base_depth = start_path.rstrip("/").count("/")
+
+    found = []
+    for full_path, name, _is_dir, depth in index:
+        if start_path != "/" and not full_path.lower().startswith(prefix.lower()):
+            continue
+        # The recursive walk enters a directory at depth d and matches its
+        # children there, so it reaches relative depth max_depth + 1. Matching
+        # that exactly matters: being one level shallow here would quietly
+        # shrink discovery, which is the failure mode this refactor exists to
+        # remove.
+        if depth - base_depth > max_depth + 1:
+            continue
+        if any(p.search(name) for p in compiled):
+            found.append(full_path)
+    return found
+
 
 def heuristic_discover_files(fs, target_patterns, start_path="/",
-                              max_depth=6, depth=0):
+                              max_depth=6, depth=0, index=None):
     """
     Recursively search for files/dirs matching target_patterns.
     Dotted directory names (e.g. Firefox hashed profiles) are now traversed.
+
+    When `index` is supplied the shared traversal is filtered instead of the
+    filesystem being walked again.
     """
+    if index is not None:
+        return match_path_index(index, target_patterns, start_path, max_depth)
+
     compiled = [re.compile(p, re.IGNORECASE) for p in target_patterns]
     found = []
-    _skip_names = {'.', '..', '$orphanfiles'}
+    _skip_names = _WALK_SKIP_NAMES
 
     def _walk(path, d):
         if d > max_depth:
@@ -669,22 +770,23 @@ def extract_user_activity(fs):
     return pd.DataFrame(records)
 
 
-def extract_recycle_bin(fs):
+def extract_recycle_bin(fs, index=None):
     records = []
     print("  [CARVE] Scanning for Recycle Bin artifacts (Global Search)...")
 
     target_files = heuristic_discover_files(
-        fs, [r'^\$I', r'^\$R', r'^INFO2$'], max_depth=10
+        fs, [r'^\$I', r'^\$R', r'^INFO2$'], max_depth=10, index=index
     )
     if not target_files:
         recycle_dirs = heuristic_discover_files(
-            fs, [r'^\$Recycle\.Bin$', r'^RECYCLER$', r'^RECYCLED$'], max_depth=4
+            fs, [r'^\$Recycle\.Bin$', r'^RECYCLER$', r'^RECYCLED$'],
+            max_depth=4, index=index
         )
         for rdir in recycle_dirs:
             target_files.extend(
                 heuristic_discover_files(
                     fs, [r'^\$I', r'^\$R', r'^INFO2$'],
-                    start_path=rdir, max_depth=6
+                    start_path=rdir, max_depth=6, index=index
                 )
             )
     if debug_extract:
@@ -722,7 +824,7 @@ def extract_recycle_bin(fs):
 # FIX-3: extract_browser_history — Firefox hashed-profile descent
 # ═══════════════════════════════════════════════════════════════════════════
 
-def extract_browser_history(fs):
+def extract_browser_history(fs, index=None):
     """
     Universal Browser Extractor.
     Firefox hashed profile directories are now explicitly descended.
@@ -739,7 +841,7 @@ def extract_browser_history(fs):
     for root in search_bases:
         found_paths.extend(
             heuristic_discover_files(fs, generic_patterns,
-                                     start_path=root, max_depth=14)
+                                     start_path=root, max_depth=14, index=index)
         )
 
     # 2. Firefox-specific: manually descend hashed profile dirs
@@ -1025,9 +1127,22 @@ def walk_filesystem(fs, limit=150000, max_depth=14):
     skip_dirs = {'winsxs', 'servicing', 'driverstore',
                  'system32', 'program files', 'program files (x86)'}
 
+    # The roots below overlap: TSK resolves '/Users' and '/USERS' to the same
+    # directory, '/' reaches both, and '/' also reaches '$OrphanFiles' before it
+    # is walked explicitly. Without these guards every such file is recorded
+    # two to four times — the artifact counts were inflated 2.8x (FILESYSTEM)
+    # and 2.0x (DELETED) on the reference image, so "1,334 deleted files" was
+    # really 663.
+    visited_dirs = set()
+    seen_paths = set()
+
     def fast_walk(directory_path, depth=0):
         if len(records) >= limit or depth > max_depth:
             return
+        dir_key = directory_path.lower().rstrip('/') or '/'
+        if dir_key in visited_dirs:
+            return
+        visited_dirs.add(dir_key)
         try:
             dir_obj = fs.open_dir(directory_path)
             if dir_obj is None:
@@ -1060,6 +1175,10 @@ def walk_filesystem(fs, limit=150000, max_depth=14):
                 try:
                     fpath = (f"{directory_path}/{name}"
                              if directory_path != "/" else f"/{name}")
+                    path_key = fpath.lower()
+                    if path_key in seen_paths:
+                        continue
+                    seen_paths.add(path_key)
 
                     is_file = (ntype == 1) or (meta_type == 1)
                     is_dir = (ntype == 2) or (meta_type == 2)
@@ -1121,7 +1240,7 @@ def walk_filesystem(fs, limit=150000, max_depth=14):
 # FIX-6: extract_communication_artifacts — wider depth; all roots searched
 # ═══════════════════════════════════════════════════════════════════════════
 
-def extract_communication_artifacts(fs):
+def extract_communication_artifacts(fs, index=None):
     """Discover email databases and communication artifacts."""
     records = []
     print("   Scanning for communication artifacts (expanded depth)...")
@@ -1133,12 +1252,13 @@ def extract_communication_artifacts(fs):
     for root in roots:
         found_paths.extend(
             heuristic_discover_files(
-                fs, email_patterns, start_path=root, max_depth=14
+                fs, email_patterns, start_path=root, max_depth=14, index=index
             )
         )
     # Also scan root for unusual placements
     found_paths.extend(
-        heuristic_discover_files(fs, email_patterns, start_path="/", max_depth=10)
+        heuristic_discover_files(fs, email_patterns, start_path="/",
+                                 max_depth=10, index=index)
     )
     # Deduplicate (normalise to lowercase key)
     seen = set()
@@ -1287,7 +1407,7 @@ def extract_execution_history(fs):
 # FIX-7: extract_srum_data — isolated; 7 case-variant probes
 # ═══════════════════════════════════════════════════════════════════════════
 
-def extract_srum_data(fs):
+def extract_srum_data(fs, index=None):
     """SRUM database extractor with expanded case-variant path probing."""
     records = []
 
@@ -1328,7 +1448,7 @@ def extract_srum_data(fs):
     print("  [SRUM] Probing via heuristic search...")
     found_paths = heuristic_discover_files(
         fs, [r'^SRUDB\.dat$', r'^srudb\.dat$'],
-        start_path="/", max_depth=10
+        start_path="/", max_depth=10, index=index
     )
     for path in found_paths:
         try:
@@ -1647,6 +1767,13 @@ def carve_evidence_from_image(image_source):
     # Lower this when a carve must be reproducible; 1 is fully serial.
     max_workers = int(os.getenv("CARVE_MAX_WORKERS", "14"))
 
+    # One traversal, shared by every discovery-based extractor. Built before the
+    # pool starts so it is also the only walk that has to be thread-safe.
+    print("  [INDEX] Building shared path index...")
+    t_index = time.time()
+    path_index = build_path_index(open_fs())
+    print(f"  [INDEX] Done in {time.time() - t_index:.1f}s")
+
     # FIX-9: SRUM and EXECUTION are independent named tasks
     print(f"  [EXEC] Starting parallel artifact extraction "
           f"(Max Workers: {max_workers})...")
@@ -1662,12 +1789,12 @@ def carve_evidence_from_image(image_source):
         ("FILESYSTEM",    isolated(walk_filesystem, 150000)),
         ("ACTIVITY",      isolated(extract_user_activity)),
         ("RECENT",        isolated(extract_recent_documents)),       # FIX-4
-        ("RECYCLE",       isolated(extract_recycle_bin)),
-        ("BROWSER",       isolated(extract_browser_history)),        # FIX-3
-        ("COMMUNICATION", isolated(extract_communication_artifacts)),  # FIX-6
+        ("RECYCLE",       isolated(extract_recycle_bin, path_index)),
+        ("BROWSER",       isolated(extract_browser_history, path_index)),  # FIX-3
+        ("COMMUNICATION", isolated(extract_communication_artifacts, path_index)),  # FIX-6
         ("USN",           isolated(extract_usn_journal)),
         ("EXECUTION",     isolated(extract_execution_history)),      # FIX-8
-        ("SRUM",          isolated(extract_srum_data)),              # FIX-7
+        ("SRUM",          isolated(extract_srum_data, path_index)),  # FIX-7
     ]
 
     filesystem_df = None
