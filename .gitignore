@@ -10,8 +10,10 @@ cache/
 /data/
 outputs/
 *.dd
-*.E01
-*.e01
+# EWF sets are split across .E01/.E02/... — matching only .E01 left the later
+# segments (hundreds of MB each) tracked. [0-9][0-9] deliberately does not
+# match .exe.
+*.[eE][0-9][0-9]
 *.img
 *.raw
 
