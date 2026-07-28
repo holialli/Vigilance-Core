@@ -1,5 +1,5 @@
 from forensics.llm import format_evidence_block
-from forensics.rag import format_citations
+from forensics.rag import cited_tags, format_citations
 
 ROWS = [
     {"tag": "E1", "time": "2024-03-01 03:02:00", "event_id": "1102",
@@ -24,6 +24,19 @@ def test_only_cited_evidence_is_rendered():
 
 def test_multiple_citations_render():
     out = format_citations(ROWS, answer_text="Cleared [E1] then logon [E2].")
+    assert "[E1]" in out and "[E2]" in out
+
+
+def test_grouped_citation_tags_are_parsed():
+    """Models write "[E3, E4, E6]" as often as "[E3]" — both must resolve."""
+    assert cited_tags("no clearing was found [E3, E4, E6]") == {"E3", "E4", "E6"}
+    assert cited_tags("cleared [E1] and [E2; E5]") == {"E1", "E2", "E5"}
+    assert cited_tags("nothing here") == set()
+
+
+def test_grouped_citations_render_in_appendix():
+    """Observed live: a grouped citation left its evidence out of the appendix."""
+    out = format_citations(ROWS, answer_text="Both support this [E1, E2].")
     assert "[E1]" in out and "[E2]" in out
 
 

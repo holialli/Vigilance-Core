@@ -280,6 +280,19 @@ def _score_frame(frame, semantic_scores, terms, routed, limit):
     return results
 
 
+def cited_tags(answer_text):
+    """Every evidence tag an answer references.
+
+    Models group citations as "[E3, E4, E6]" as readily as they write "[E3]".
+    Matching only the single-tag form silently dropped the grouped ones from the
+    appendix, so evidence the answer actually relied on became unverifiable.
+    """
+    tags = set()
+    for group in re.findall(r'\[((?:\s*E\d+\s*[,;]?)+)\]', answer_text or ""):
+        tags.update(re.findall(r'E\d+', group))
+    return tags
+
+
 def format_citations(rows, cited_only=True, answer_text=""):
     """Render retrieved evidence as a markdown appendix for the chat/report."""
     if not rows:
@@ -287,7 +300,7 @@ def format_citations(rows, cited_only=True, answer_text=""):
 
     shown = rows
     if cited_only and answer_text:
-        referenced = set(re.findall(r'\[(E\d+)\]', answer_text))
+        referenced = cited_tags(answer_text)
         if referenced:
             shown = [r for r in rows if r["tag"] in referenced]
 

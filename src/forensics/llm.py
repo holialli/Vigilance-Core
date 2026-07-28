@@ -7,8 +7,14 @@ import urllib.request
 from .context import extract_system_context
 
 GEMINI_API_KEY  = os.getenv("GEMINI_API_KEY", "")
-GEMINI_MODEL_ID = "gemini-2.0-flash"
-gemini_client   = None
+
+# Pinned model IDs get retired or dropped from the free tier without warning —
+# 'gemini-2.0-flash' now returns 429 with "limit: 0" on free keys, and 2.5-flash
+# 404s for new users. The '-latest' aliases track whatever is current, so try
+# them in order rather than trusting one hardcoded ID.
+GEMINI_MODEL_ID  = os.getenv("GEMINI_MODEL", "gemini-flash-latest")
+GEMINI_FALLBACKS = ["gemini-flash-lite-latest", "gemini-2.0-flash"]
+gemini_client    = None
 if GEMINI_API_KEY:
     try:
         from google import genai
@@ -180,16 +186,17 @@ FORMATTING RULES (STRICT):
 
     # ── Priority 3: Gemini (cloud fallback) ───────────────────────────────
     if gemini_client:
-        try:
-            response = gemini_client.models.generate_content(
-                model=GEMINI_MODEL_ID,
-                contents=prompt,
-                config={"system_instruction": system_prompt, "temperature": 0.1}
-            )
-            print("  [LLM] Response from Gemini")
-            return response.text
-        except Exception as e:
-            print(f"  [LLM] Gemini error: {e}")
+        for model_id in [GEMINI_MODEL_ID] + GEMINI_FALLBACKS:
+            try:
+                response = gemini_client.models.generate_content(
+                    model=model_id,
+                    contents=prompt,
+                    config={"system_instruction": system_prompt, "temperature": 0.1}
+                )
+                print(f"  [LLM] Response from Gemini ({model_id})")
+                return response.text
+            except Exception as e:
+                print(f"  [LLM] Gemini error on {model_id}: {e}")
 
     # ── Priority 4: Offline deterministic summary ─────────────────────────
     print("  [LLM] All providers failed — returning deterministic summary")
