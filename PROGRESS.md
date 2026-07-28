@@ -24,7 +24,7 @@ Real evidence used throughout (both gitignored, sitting in the repo root):
   opened. Errors out correctly via the existing "Split E01 Image Detected" guard.
   Not a bug; get the remaining segments if you want to use it.
 
-Carve is slow — **~19 min threaded, longer serial**. Run it in the background.
+Carve is slow — **~19 min threaded (lossy), 2h0m serial (correct)**. Background it.
 Scratch scripts used this session (re-create as needed): a carve-and-pickle
 runner, an EVTX-only runner, and a citation end-to-end harness.
 
@@ -146,7 +146,30 @@ Four extractors did exactly that:
 | `extract_user_activity` | same shape at both loop levels |
 | `heuristic_discover_files`, `walk_filesystem` | siblings listed after the first subdirectory (this is the discovery path for recycle bin / browser / email) |
 
-EVTX run alone: **9,023 → 17,423 events across 42 channels.**
+Full serial carve, before vs after (same image, `CARVE_MAX_WORKERS=1`):
+
+| ArtifactType | before | after | delta |
+|---|---:|---:|---:|
+| REGISTRY | 54,395 | 56,869 | +2,474 |
+| EVTX | 15,620 (39 channels) | **17,336 (42 channels)** | +1,716 |
+| FILESYSTEM | 9,109 | **13,009** | +3,900 |
+| EXECUTION | 0 | 492 | +492 |
+| **BROWSER** | 0 | **73** | **+73** |
+| COMMUNICATION | 0 | 28 | +28 |
+| PREFETCH / RECYCLE | 0 | 5 / 4 | +9 |
+| **TOTAL** | 80,554 | **89,247** | **+8,693** |
+
+**The browser recovery is the headline.** An earlier note in this doc claimed
+BROWSER was 0 because the image only has IE-era `index.dat` and the parser is
+SQLite-only. **That was wrong.** The truncated discovery walk was hiding a
+Firefox profile buried deep in the tree —
+`AppData/Roaming/Mozilla/Firefox/Profiles/8pp14cbi.default/places.sqlite`.
+With the walk completing, browser targets went 2 → 6 and Firefox parsed fine,
+recovering the actual investigative payload of this training image (searches
+for "identity theft jail time", "how to steal identities", "handguns").
+
+A truncating filesystem walk does not fail loudly — it just makes the most
+deeply nested evidence, which is often the most incriminating, disappear.
 
 Also removed the bare `except: continue` that hid all of this — an unreadable
 channel is a gap in the evidence and the examiner has to know which one.
@@ -176,24 +199,33 @@ With error reporting now in place, a 14-worker carve visibly fails with
 event-log evidence, lost nondeterministically.
 
 `CARVE_MAX_WORKERS` was added so a carve can be made reproducible (`1` = serial).
-**Decide the default.** Options:
-- Default to serial. Correct, and threading buys less than it looks like — the
-  threaded carve was already ~19 min.
-- Move to `ProcessPoolExecutor`. True isolation *and* parallelism, but the task
-  closures (`isolated(fn)`) aren't picklable, so it needs module-level worker
-  functions taking `(task_name, image_path, offset)`.
+**Serial is correct but not shippable as the default: it took 7,194s (2h0m)**
+against ~19 min threaded. Measured, not estimated.
 
-A serial verification run was in flight when this doc was written. It had
-already confirmed `Application.evtx` 1,616, `System.evtx` 5,523,
-`WindowsUpdateClient` 928, `User Profile Service` 190 and `Firewall` 356 — every
-channel that fails under threads. **Finish that run and record the totals.**
+The slowness is not just the lost parallelism — it exposed a design flaw.
+`heuristic_discover_files` does a full recursive traversal of the image, and it
+is called **independently by RECYCLE, BROWSER, COMMUNICATION and SRUM**: four
+complete walks of the same 300 MB image where one would do. That was cheap while
+the walk was truncating early (i.e. while it was broken) and dominates the carve
+now that it is correct.
 
-### 2. BROWSER is 0, and it is not the race
-The image's browser artifacts are `/Users/Jimmy Wilson/AppData/Local/History`
-and `/Users/Jimmy Wilson/Cookies` — **IE-era `index.dat`, not SQLite**. The
-extractor only handles SQLite, so it logs `file is not a database` and returns 0.
-An earlier note claiming 49 browser artifacts was wrong. Needs an `index.dat`
-parser (or accept the gap and say so in the UI).
+**Next step, in order:**
+1. **Collapse the four traversals into one.** Walk once, match every pattern set
+   against that single listing. Correctness-neutral and the biggest win — it may
+   make threading unnecessary, or at least make the next step cheap to validate.
+2. Then re-measure threaded. If `$IDX_ROOT` corruption persists, move to
+   `ProcessPoolExecutor` for true isolation (libtsk keeps process-global state,
+   which is why per-thread handles could not fix it). The task closures
+   (`isolated(fn)`) aren't picklable, so this needs module-level workers taking
+   `(task_name, image_path, offset)`.
+
+### 2. Promote the good carve into the cache
+`src/cache/<sha256>/artifacts.pkl` still holds the **old racy carve** (80,554
+rows, no BROWSER/EXECUTION/COMMUNICATION). The verified serial carve (89,247
+rows) is sitting in the session scratchpad as `recarve2.pkl` and was **not**
+promoted, because replacing it changes `embed_df` size and invalidates the
+cached FAISS index — forcing a ~50-minute re-embed. Do it deliberately, and
+delete the stale `faiss.index` at the same time.
 
 ### 3. Segfault during FAISS index build — unresolved
 The citation harness segfaulted **3 times in a row** inside torch's BERT forward
@@ -207,19 +239,19 @@ Root cause unknown; **no fix applied.** Worth pinning down, because the app
 builds indexes in a background thread and supports concurrent investigators — a
 native crash there takes the whole Gradio server down.
 
-### 4. The ML model is close to useless as-is
+### 5. The ML model is close to useless as-is
 `AnomalyScore == -1` fires on **30.1%** of artifacts (23,068 / 76,693) on the
 real image. Trained on synthetic CSVs that look nothing like real registry data.
 `anomaly_overview()` reports the flag rate and warns, but the real fix is
 retraining on features from actual carved images — or dropping the statistical
 model and keeping only the heuristic Event-ID rules, which *do* work.
 
-### 5. Not a bug: missing NTUSER hives
+### 6. Not a bug: missing NTUSER hives
 `BillyBob`, `Fred Flintstone`, `James Russell` and `Joe Nameless` report
 "NTUSER.DAT not found" **even in a fully serial carve** — those profiles genuinely
 have no hive. Only `Jimmy Wilson` does. Don't chase this.
 
-### 6. Smaller items
+### 7. Smaller items
 - `extractors.py` is ~1730 lines — split per artifact family.
 - Prefetch parsing reads only filenames/timestamps — no run counts from the `.pf` body.
 - Leads ranking still puts `svchost.exe` on top; ubiquitous system binaries
@@ -230,6 +262,10 @@ have no hive. Only `Jimmy Wilson` does. Don't chase this.
 
 ## Gotchas
 
+- **A truncating walk is silent.** It doesn't error — it just makes the most
+  deeply nested evidence vanish, and deeply nested is often the most
+  incriminating (the Firefox history here was 6 levels down). If an extractor
+  returns suspiciously few artifacts, suspect the traversal before the parser.
 - **Don't trust a clean run.** Nearly every bug here only appeared against the
   real E01 — ShimCache padding, mixed timezones, triage false positives, the
   thread race, the iteration truncation. Unit tests passed the whole time.
