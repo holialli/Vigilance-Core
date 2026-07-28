@@ -101,6 +101,10 @@ def heuristic_discover_files(fs, target_patterns, start_path="/",
         except Exception:
             return
 
+        # Drain the listing before touching the filesystem again. Recursing (or
+        # probing with open_dir) while this directory is mid-iteration truncates
+        # it, so entries past the first subdirectory were never even examined.
+        entries = []
         for entry in directory:
             try:
                 raw_name = entry.info.name.name
@@ -108,15 +112,20 @@ def heuristic_discover_files(fs, target_patterns, start_path="/",
                         if isinstance(raw_name, bytes) else raw_name)
                 if name.lower() in _skip_names:
                     continue
+                ntype = entry.info.name.type if entry.info.name else 0
+                meta_type = (entry.info.meta.type
+                             if entry.info.meta is not None else 0)
+                entries.append((name, ntype, meta_type))
+            except Exception:
+                continue
 
+        for name, ntype, meta_type in list(dict.fromkeys(entries)):
+            try:
                 full_path = f"{path}/{name}" if path != "/" else f"/{name}"
 
                 if any(p.search(name) for p in compiled):
                     found.append(full_path)
 
-                ntype     = entry.info.name.type if entry.info.name else 0
-                meta_type = (entry.info.meta.type
-                             if entry.info.meta is not None else 0)
                 is_dir = (ntype == 2) or (meta_type == 2)
 
                 # Fallback for entries where type field is unreliable
@@ -151,12 +160,27 @@ def extract_all_evtx(fs):
         if evtx_dir is None:
             continue
 
+        # Names are collected before any file is read. Reading a file through
+        # the same handle that is mid-iteration can cut the directory listing
+        # short, which silently drops whole channels (System.evtx and
+        # Application.evtx went missing this way — the largest logs on the image).
+        names = []
         for entry in evtx_dir:
             try:
                 fname = entry.info.name.name.decode('utf-8', errors='ignore')
-                if not fname.lower().endswith('.evtx'):
-                    continue
-                fpath = f"{evtx_dir_path}/{fname}"
+            except Exception:
+                continue
+            if fname.lower().endswith('.evtx'):
+                names.append(fname)
+        # A directory can list the same name twice (an unallocated entry
+        # alongside the live one); opening it twice just duplicates every event.
+        names = list(dict.fromkeys(names))
+        print(f"   Found {len(names)} .evtx files in {evtx_dir_path}")
+
+        skipped = []
+        for fname in names:
+            fpath = f"{evtx_dir_path}/{fname}"
+            try:
                 f_obj = fs.open(fpath)
                 if f_obj.info.meta.size < 1024:
                     continue
@@ -167,8 +191,15 @@ def extract_all_evtx(fs):
                     evtx_df['LogSource'] = channel_name
                     all_evtx_frames.append(evtx_df)
                     print(f"   Extracted {len(evtx_df)} events from {fname}")
-            except Exception:
-                continue
+            except Exception as exc:
+                # Never swallow silently: an unreadable channel is a gap in the
+                # evidence and the examiner has to know which one.
+                skipped.append(f"{fname} ({type(exc).__name__}: {exc})")
+
+        if skipped:
+            print(f"   [WARN] {len(skipped)} EVTX file(s) could not be read:")
+            for item in skipped:
+                print(f"      - {item}")
         break
 
     if all_evtx_frames:
@@ -479,26 +510,34 @@ def extract_all_ntuser(fs):
             except Exception:
                 continue
 
+            # Collect profile names before opening any hive. Reading a file
+            # through the handle that is iterating this directory truncates the
+            # listing, so every profile after the first one silently disappeared.
+            profile_names = []
             for entry in users_dir:
                 try:
                     raw = entry.info.name.name
                     name = (raw.decode('utf-8', errors='ignore')
                             if isinstance(raw, bytes) else raw)
-                    if name.lower() in _skip_names:
-                        continue
+                except Exception:
+                    continue
+                if name.lower() in _skip_names:
+                    continue
+                ntype = entry.info.name.type
+                meta_type = entry.info.meta.type if entry.info.meta else 0
+                profile_names.append((name, (ntype == 2) or (meta_type == 2)))
+            profile_names = list(dict.fromkeys(profile_names))
 
-                    # FIX-5: verify it is a directory before proceeding
-                    ntype = entry.info.name.type
-                    meta_type = entry.info.meta.type if entry.info.meta else 0
-                    is_dir = (ntype == 2) or (meta_type == 2)
-                    if not is_dir:
+            for name, typed_as_dir in profile_names:
+                try:
+                    # FIX-5: verify it is a directory before proceeding. The
+                    # open_dir probe happens here rather than during iteration
+                    # above, for the same reason the hive read does.
+                    if not typed_as_dir:
                         try:
                             fs.open_dir(f"{base_root}/{name}")
-                            is_dir = True
                         except Exception:
-                            is_dir = False
-                    if not is_dir:
-                        continue
+                            continue
 
                     ntuser_path = f"{base_root}/{name}/NTUSER.DAT"
                     norm = ntuser_path.lower()
@@ -539,21 +578,35 @@ def extract_user_activity(fs):
                 users_dir = fs.open_dir(base_root)
             except Exception:
                 continue
+            # Names first, reads second — see extract_all_evtx: reading through
+            # a handle mid-iteration cuts the listing short.
+            profile_names = []
             for entry in users_dir:
-                name = entry.info.name.name.decode('utf-8', errors='ignore')
-                if name.lower() in skip_names:
+                try:
+                    name = entry.info.name.name.decode('utf-8', errors='ignore')
+                except Exception:
                     continue
+                if name.lower() not in skip_names:
+                    profile_names.append(name)
 
+            for name in list(dict.fromkeys(profile_names)):
                 recent_path = f"{base_root}/{name}/AppData/Roaming/Microsoft/Windows/Recent"
                 try:
                     recent_dir = fs.open_dir(recent_path)
                     if recent_dir is None:
                         continue
+                    lnk_names = []
                     for lnk_entry in recent_dir:
                         try:
                             lname = lnk_entry.info.name.name.decode('utf-8', errors='ignore')
-                            if not lname.lower().endswith('.lnk'):
-                                continue
+                        except Exception:
+                            continue
+                        if lname.lower().endswith('.lnk'):
+                            lnk_names.append((lname, lnk_entry.info.meta.mtime
+                                              if lnk_entry.info.meta else 0))
+
+                    for lname, lnk_mtime in list(dict.fromkeys(lnk_names)):
+                        try:
                             f_obj = fs.open(f"{recent_path}/{lname}")
                             data = f_obj.read_random(0, f_obj.info.meta.size)
 
@@ -566,7 +619,7 @@ def extract_user_activity(fs):
                                     target_path = data[start:end].decode('utf-8', errors='ignore')
 
                             mtime = datetime.fromtimestamp(
-                                lnk_entry.info.meta.mtime, timezone.utc
+                                lnk_mtime, timezone.utc
                             ).strftime('%Y-%m-%d %H:%M:%S')
                             records.append({
                                 'Date and Time': mtime,
@@ -979,19 +1032,35 @@ def walk_filesystem(fs, limit=150000, max_depth=14):
             dir_obj = fs.open_dir(directory_path)
             if dir_obj is None:
                 return
+
+            # Snapshot the listing before recursing. Descending into a
+            # subdirectory while this one is still being iterated truncates it,
+            # so siblings after the first subdirectory were never indexed.
+            listing = []
             for entry in dir_obj:
-                if len(records) >= limit:
-                    return
                 try:
                     name = entry.info.name.name.decode('utf-8', errors='ignore')
                     if name in ['.', '..']:
                         continue
+                    meta = entry.info.meta
+                    listing.append((
+                        name,
+                        entry.info.name.type,
+                        meta.type if meta else None,
+                        meta.mtime if meta else None,
+                        meta.size if meta and meta.size else 0,
+                        _is_deleted(entry),
+                    ))
+                except Exception:
+                    continue
+
+            for name, ntype, meta_type, m_time, size, deleted in listing:
+                if len(records) >= limit:
+                    return
+                try:
                     fpath = (f"{directory_path}/{name}"
                              if directory_path != "/" else f"/{name}")
 
-                    meta = entry.info.meta
-                    ntype = entry.info.name.type
-                    meta_type = meta.type if meta else None
                     is_file = (ntype == 1) or (meta_type == 1)
                     is_dir = (ntype == 2) or (meta_type == 2)
                     if not is_dir and ntype not in (1, 2):
@@ -1001,11 +1070,9 @@ def walk_filesystem(fs, limit=150000, max_depth=14):
                         except Exception:
                             is_dir = False
                     ext = os.path.splitext(name)[1].lower() if is_file else ''
-                    mtime = (datetime.fromtimestamp(meta.mtime, timezone.utc)
+                    mtime = (datetime.fromtimestamp(m_time, timezone.utc)
                              .strftime('%Y-%m-%d %H:%M:%S UTC')
-                             if meta and meta.mtime else 'N/A')
-                    size = meta.size if meta and meta.size else 0
-                    deleted = _is_deleted(entry)
+                             if m_time else 'N/A')
 
                     if is_file or is_dir:
                         ftype = "Directory" if is_dir else "File"
@@ -1556,8 +1623,15 @@ def carve_evidence_from_image(image_source):
             return fn(open_fs(), *extra)
         return runner
 
+    # Per-task handles removed the worst of the corruption but did not eliminate
+    # it: libtsk keeps process-global state, so concurrent path resolution still
+    # intermittently fails with '$IDX_ROOT not found' and drops whole channels.
+    # Lower this when a carve must be reproducible; 1 is fully serial.
+    max_workers = int(os.getenv("CARVE_MAX_WORKERS", "14"))
+
     # FIX-9: SRUM and EXECUTION are independent named tasks
-    print(f"  [EXEC] Starting parallel artifact extraction (Max Workers: 14)...")
+    print(f"  [EXEC] Starting parallel artifact extraction "
+          f"(Max Workers: {max_workers})...")
 
     tasks = [
         ("EVTX",          isolated(extract_all_evtx)),
@@ -1580,7 +1654,7 @@ def carve_evidence_from_image(image_source):
 
     filesystem_df = None
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=14) as executor:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_to_name = {
             executor.submit(fn): name for name, fn in tasks
         }
