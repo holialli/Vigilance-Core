@@ -1541,6 +1541,24 @@ def carve_evidence_from_image(image_source):
     if is_e01:
         try:
             import pyewf
+
+            # A multi-segment E01 set must be opened with every segment. Only
+            # the first was ever passed — the UI hands over a single path — so
+            # any split image failed at the first segment boundary and was
+            # reported as "segments missing" even with the .E02 sitting right
+            # beside it. glob() discovers the siblings by naming convention.
+            if not isinstance(image_source, list):
+                try:
+                    globbed = list(pyewf.glob(primary_file))
+                    if globbed:
+                        filepaths = globbed
+                        if len(globbed) > 1:
+                            print(f"  [E01] Multi-segment set: "
+                                  f"{len(globbed)} segments located.")
+                except Exception as exc:
+                    print(f"  [WARN] E01 segment glob failed ({exc}); "
+                          f"opening the given file only.")
+
             ewf_handle = pyewf.handle()
             ewf_handle.open(filepaths)
 
