@@ -219,6 +219,31 @@ def test_index_is_built_from_exactly_one_traversal():
     assert fs.access_count == walks_for_index
 
 
+def test_ntfs_metafiles_are_not_reported_as_recycled_items():
+    """'^\\$R' matches $Reparse/$RmMetadata/$Repair, which are not deleted data."""
+    fs = FakeFS({
+        "/": [_Entry("$Extend", type_=2), _Entry("$RECYCLE.BIN", type_=2)],
+        "/$Extend": [
+            _Entry("$Reparse"),
+            _Entry("$RmMetadata", type_=2),
+        ],
+        "/$Extend/$RmMetadata": [_Entry("$Repair")],
+        "/$RECYCLE.BIN": [_Entry("S-1-5-21-1001", type_=2)],
+        "/$RECYCLE.BIN/S-1-5-21-1001": [
+            _Entry("$IABCDEF.pdf"), _Entry("$RABCDEF.pdf"),
+        ],
+    })
+    index = extractors.build_path_index(fs, max_depth=14)
+
+    frame = extractors.extract_recycle_bin(fs, index=index)
+    reported = "\n".join(frame["Task Category"].astype(str)) if not frame.empty else ""
+
+    assert "$Reparse" not in reported
+    assert "$RmMetadata" not in reported
+    assert "$Repair" not in reported
+    assert "$IABCDEF.pdf" in reported
+
+
 def test_index_reaches_recycle_bin_contents():
     """$Recycle.Bin is skipped by the per-call walk but must be in the index."""
     fs = FakeFS(_deep_tree())

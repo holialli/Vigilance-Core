@@ -770,6 +770,9 @@ def extract_user_activity(fs):
     return pd.DataFrame(records)
 
 
+_RECYCLE_DIR_RE = re.compile(r'(\$recycle\.bin|recycler|recycled)', re.I)
+
+
 def extract_recycle_bin(fs, index=None):
     records = []
     print("  [CARVE] Scanning for Recycle Bin artifacts (Global Search)...")
@@ -789,6 +792,17 @@ def extract_recycle_bin(fs, index=None):
                     start_path=rdir, max_depth=6, index=index
                 )
             )
+
+    # '^\$R' also matches NTFS metafiles — $Reparse, $RmMetadata and $Repair all
+    # live under /$Extend and are not deleted user data. Deleted-item records
+    # only ever live inside a recycle-bin directory, so require that.
+    filtered = [p for p in target_files if _RECYCLE_DIR_RE.search(p)]
+    discarded = len(target_files) - len(filtered)
+    target_files = filtered
+    if discarded and debug_extract:
+        print(f"  [DEBUG] Ignored {discarded} NTFS metafile(s) matching $I/$R "
+              f"outside any recycle-bin directory.")
+
     if debug_extract:
         print(f"  [DEBUG] Recycle Bin hits: {len(target_files)}")
 
