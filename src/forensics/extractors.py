@@ -16,6 +16,8 @@ from .config import HASHSET_BAD_PATH, HASHSET_GOOD_PATH, debug_extract
 from .hashsets import (hash_image_files, hash_summary, load_hashset,
                        match_hashsets)
 from .parsers import EWFImgInfo, parse_evtx_file, parse_registry_hive
+from .recyclebin import describe as describe_recycle
+from .recyclebin import parse_i_file, parse_info2
 from .shimcache import parse_appcompatcache
 
 
@@ -815,7 +817,41 @@ def extract_recycle_bin(fs, index=None):
 
             parts = path.split('/')
             context = parts[-2] if len(parts) > 2 else "Unknown"
+            leaf = parts[-1]
 
+            # Read the record so the entry says what was deleted. Reporting only
+            # that a recycle-bin file exists tells an examiner nothing: the
+            # original path, size and deletion time all live inside INFO2/$I.
+            parsed = []
+            try:
+                size = meta.size if meta and meta.size else 0
+                if size and size < (8 << 20):
+                    data = f_obj.read_random(0, size)
+                    if leaf.upper() == 'INFO2':
+                        parsed = parse_info2(data)
+                    elif leaf.upper().startswith('$I'):
+                        one = parse_i_file(data)
+                        parsed = [one] if one else []
+            except Exception as exc:
+                if debug_extract:
+                    print(f"  [DEBUG] Recycle record parse failed for {path}: {exc}")
+
+            if parsed:
+                for record in parsed:
+                    deleted_at = record.get('deleted_time')
+                    records.append({
+                        'Date and Time': (deleted_at.strftime('%Y-%m-%d %H:%M:%S UTC')
+                                          if deleted_at else ts_str),
+                        'Event ID': '9800',
+                        'Task Category': describe_recycle(record, path),
+                        'LogSource': 'RECYCLE_BIN',
+                        'Keywords': 'Alert',
+                        'ArtifactType': 'RECYCLE',
+                    })
+                continue
+
+            # $R files hold the deleted content itself and carry no metadata;
+            # the paired $I record above is what names them.
             records.append({
                 'Date and Time': ts_str,
                 'Event ID': '9800',
