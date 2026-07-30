@@ -92,6 +92,42 @@ _INDEX_SKIP_DIRS_LOWER = {'winsxs', 'servicing', 'driverstore', 'windows.old'}
 _WALK_SKIP_NAMES = {'.', '..', '$orphanfiles'}
 
 
+def _meta_addr(entry):
+    """Inode for a directory entry, from the name record when meta is absent."""
+    try:
+        meta = entry.info.meta
+        if meta is not None and meta.addr:
+            return int(meta.addr)
+    except Exception:
+        pass
+    try:
+        name = entry.info.name
+        if name is not None and name.meta_addr:
+            return int(name.meta_addr)
+    except Exception:
+        pass
+    return None
+
+
+def _open_dir_by_inode(fs, meta_addr):
+    """Open a directory by inode, or None if it is not a directory.
+
+    Never resolve a child by path string. TSK resolves a path by scanning each
+    parent directory's entries in turn, so the cost is the size of the parents,
+    not the depth — and a probe that *fails* (the common case, since the caller
+    is asking "is this a directory?" about a file) scans the parent to the end
+    first. In /WINDOWS/system32, 1,794 entries, that is ~200ms per probe; a
+    quarter of all entries need one. That single line was 4,146s of a 5,215s
+    carve on the reference image. By inode it is one lookup, ~0ms.
+    """
+    if not meta_addr:
+        return None
+    try:
+        return fs.open_dir(inode=meta_addr)
+    except Exception:
+        return None
+
+
 def build_path_index(fs, start_path="/", max_depth=14):
     """Walk the image once and record every path found.
 
@@ -105,14 +141,8 @@ def build_path_index(fs, start_path="/", max_depth=14):
     """
     index = []
 
-    def _walk(path, depth):
-        if depth > max_depth:
-            return
-        try:
-            directory = fs.open_dir(path)
-            if directory is None:
-                return
-        except Exception:
+    def _walk(path, depth, directory):
+        if depth > max_depth or directory is None:
             return
 
         entries = []
@@ -126,29 +156,90 @@ def build_path_index(fs, start_path="/", max_depth=14):
                 ntype = entry.info.name.type if entry.info.name else 0
                 meta_type = (entry.info.meta.type
                              if entry.info.meta is not None else 0)
-                entries.append((name, ntype, meta_type))
+                entries.append((name, ntype, meta_type, _meta_addr(entry),
+                                entry))
             except Exception:
                 continue
 
-        for name, ntype, meta_type in list(dict.fromkeys(entries)):
+        # Dedup on (name, type, type) exactly as before — the inode is carried
+        # along, not part of the key, so a deleted and a live entry sharing a
+        # name still collapse to one the way they always did.
+        #
+        # But take the inode from whichever copy actually has one. A name can be
+        # listed twice with an identical key, once with meta_addr 0: on the
+        # reference image 'wizdata.dat' and '~DF99EB.tmp' both list first with 0
+        # and again with a real inode, and only the second can be opened. Keeping
+        # the first blindly classified both as files and lost 67 paths beneath
+        # them, including an ARJ toolset in the suspect's temp directory.
+        # A name can also list twice under *different* keys (differing
+        # meta_type), so both survive dedup and the stale copy has no inode of
+        # its own. Let it borrow the inode its live twin resolved with,
+        # otherwise the same path is reported as a directory and then as a file.
+        name_addr = {}
+        for name, _nt, _mt, addr, _e in entries:
+            if addr and name not in name_addr:
+                name_addr[name] = addr
+
+        unique, pos = [], {}
+        for name, ntype, meta_type, addr, entry in entries:
+            key = (name, ntype, meta_type)
+            if key in pos:
+                i = pos[key]
+                if not unique[i][3] and addr:
+                    unique[i] = (name, ntype, meta_type, addr, entry)
+                continue
+            pos[key] = len(unique)
+            unique.append((name, ntype, meta_type, addr, entry))
+
+        for name, ntype, meta_type, addr, entry in unique:
             try:
                 full_path = f"{path}/{name}" if path != "/" else f"/{name}"
                 is_dir = (ntype == 2) or (meta_type == 2)
-                if not is_dir and ntype not in (1, 2):
+
+                child = _open_dir_by_inode(fs, addr)
+                if child is None and ntype not in (1, 2):
+                    # No inode to ask about. as_directory() answers from the
+                    # entry we already hold, with no lookup of any kind — the
+                    # path probe here cost 297s of a 302s walk.
                     try:
-                        fs.open_dir(full_path)
-                        is_dir = True
+                        child = entry.as_directory()
                     except Exception:
-                        is_dir = False
+                        child = None
+                    if child is None and not addr:
+                        child = _open_dir_by_inode(fs, name_addr.get(name))
+                if not is_dir and ntype not in (1, 2):
+                    is_dir = child is not None
+                if is_dir and child is None:
+                    # Known directory that yielded no handle. Never reached on a
+                    # real image (every live directory has an inode), but the
+                    # path lookup is the only route an fs without inodes has.
+                    try:
+                        child = entry.as_directory()
+                    except Exception:
+                        child = None
+                    if child is None:
+                        try:
+                            child = fs.open_dir(full_path)
+                        except Exception:
+                            child = None
 
                 index.append((full_path, name, is_dir, depth + 1))
 
-                if is_dir and name.lower() not in _INDEX_SKIP_DIRS_LOWER:
-                    _walk(full_path, depth + 1)
+                # No visited-inode guard: five PCHEALTH help-center directories
+                # are legitimately reachable by more than one name, and skipping
+                # the repeat visit silently dropped ~100 paths. max_depth is the
+                # termination bound, as it was before.
+                if (is_dir and child is not None
+                        and name.lower() not in _INDEX_SKIP_DIRS_LOWER):
+                    _walk(full_path, depth + 1, child)
             except Exception:
                 continue
 
-    _walk(start_path, 0)
+    try:
+        root = fs.open_dir(start_path)
+    except Exception:
+        root = None
+    _walk(start_path, 0, root)
     print(f"  [INDEX] Indexed {len(index)} paths in a single traversal.")
     return index
 
@@ -1186,7 +1277,7 @@ def walk_filesystem(fs, limit=150000, max_depth=14):
     visited_dirs = set()
     seen_paths = set()
 
-    def fast_walk(directory_path, depth=0):
+    def fast_walk(directory_path, depth=0, dir_obj=None):
         if len(records) >= limit or depth > max_depth:
             return
         dir_key = directory_path.lower().rstrip('/') or '/'
@@ -1194,7 +1285,10 @@ def walk_filesystem(fs, limit=150000, max_depth=14):
             return
         visited_dirs.add(dir_key)
         try:
-            dir_obj = fs.open_dir(directory_path)
+            # Only the entry roots are resolved by path; children arrive as an
+            # already-open directory object. See _open_dir_by_inode.
+            if dir_obj is None:
+                dir_obj = fs.open_dir(directory_path)
             if dir_obj is None:
                 return
 
@@ -1215,11 +1309,12 @@ def walk_filesystem(fs, limit=150000, max_depth=14):
                         meta.mtime if meta else None,
                         meta.size if meta and meta.size else 0,
                         _is_deleted(entry),
+                        _meta_addr(entry),
                     ))
                 except Exception:
                     continue
 
-            for name, ntype, meta_type, m_time, size, deleted in listing:
+            for name, ntype, meta_type, m_time, size, deleted, addr in listing:
                 if len(records) >= limit:
                     return
                 try:
@@ -1232,12 +1327,17 @@ def walk_filesystem(fs, limit=150000, max_depth=14):
 
                     is_file = (ntype == 1) or (meta_type == 1)
                     is_dir = (ntype == 2) or (meta_type == 2)
-                    if not is_dir and ntype not in (1, 2):
+                    child = _open_dir_by_inode(fs, addr)
+                    # seen_paths keeps the first listing of a name, which may be
+                    # the meta_addr-0 copy; without this the directory is filed
+                    # as a plain file and its contents never walked.
+                    if child is None and not addr and ntype not in (1, 2):
                         try:
-                            fs.open_dir(fpath)
-                            is_dir = True
+                            child = fs.open_dir(fpath)
                         except Exception:
-                            is_dir = False
+                            child = None
+                    if not is_dir and ntype not in (1, 2):
+                        is_dir = child is not None
                     ext = os.path.splitext(name)[1].lower() if is_file else ''
                     mtime = (datetime.fromtimestamp(m_time, timezone.utc)
                              .strftime('%Y-%m-%d %H:%M:%S UTC')
@@ -1265,7 +1365,7 @@ def walk_filesystem(fs, limit=150000, max_depth=14):
                         })
 
                     if is_dir and depth < max_depth and name.lower() not in skip_dirs:
-                        fast_walk(fpath, depth + 1)
+                        fast_walk(fpath, depth + 1, child)
                 except Exception:
                     continue
         except Exception:
