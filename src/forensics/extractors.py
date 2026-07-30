@@ -1943,11 +1943,23 @@ def carve_evidence_from_image(image_source):
             return fn(open_fs(), *extra)
         return runner
 
-    # Per-task handles removed the worst of the corruption but did not eliminate
-    # it: libtsk keeps process-global state, so concurrent path resolution still
-    # intermittently fails with '$IDX_ROOT not found' and drops whole channels.
-    # Lower this when a carve must be reproducible; 1 is fully serial.
-    max_workers = int(os.getenv("CARVE_MAX_WORKERS", "14"))
+    # Serial by default, because concurrency here costs evidence and buys
+    # nothing. Per-task handles removed the worst of the corruption but not all
+    # of it: libtsk keeps process-global state, so concurrent path resolution
+    # still intermittently fails with '$IDX_ROOT not found' and drops whole
+    # channels. Measured on the Win7 reference image, 14 workers vs serial:
+    #
+    #     wall 112.8s vs 106.5s      -- threading is *slower*
+    #     EVTX 17,001 vs 17,336      -- 6 channels lost to $IDX_ROOT
+    #     rows 79,853 vs 80,191      -- also 2 ACTIVITY, 1 COMMUNICATION
+    #
+    # It loses because the phase is 83% EVTX parsing, which is pure Python under
+    # the GIL (python-evtx builds and re-parses XML per record), so threads
+    # cannot overlap it with anything except libtsk's C calls -- while still
+    # paying 16 extra image handles and the contention that corrupts libtsk.
+    # Raise this only with evidence that it has stopped losing rows; the way to
+    # actually parallelise the carve is a process pool over the EVTX files.
+    max_workers = int(os.getenv("CARVE_MAX_WORKERS", "1"))
 
     # One traversal, shared by every discovery-based extractor. Built before the
     # pool starts so it is also the only walk that has to be thread-safe.

@@ -1,7 +1,8 @@
 # Vigilance-Core — Progress & Handoff
 
-Working notes for continuing this project. Last updated after the walk-performance pass
-(`325d9df`), which cut the carve from 87 minutes to roughly 18.
+Working notes for continuing this project. Last updated after profiling the
+extractor phase, which closed the concurrency question: **the carve is serial by
+default now**, and a full carve of the NIST image is ~22s, not 87 minutes.
 
 Repo: `holialli/Vigilance-Core` (branch `main`). 122 tests passing (`python -m pytest tests/ -q`).
 
@@ -16,31 +17,36 @@ coverage; competing on the AI/triage layer Autopsy doesn't have.
 
 ## Start here
 
-**State:** clean. `main` at `325d9df`, working tree clean, 122 tests passing,
+**State:** clean. `main` at `7e6b9c5`, working tree clean, 122 tests passing,
 NIST re-validated 11/11 through a full carve. Nothing is half-finished.
 
 **In flight:** nothing. The last session ended on a committed, verified change.
 
 **Next, in the order I'd do it:**
 
-1. **Profile the extractor phase.** ~1,070s and never profiled. The shared walk
-   turned out to be 79% of a carve and 99% of *that* was one bad line
-   (`fs.open_dir(path_string)`); the extractors call into the same API and very
-   likely repeat it. Grep the extractors for `open_dir(` and `open(` taking a
-   path, and time one extractor before assuming. Highest expected value.
-2. **Then re-decide `CARVE_MAX_WORKERS`** (item 1 below). Do this *after* (1) —
-   (1) changes the numbers the decision rests on, exactly as it already did once.
-3. **Fix the FAISS/OpenMP segfault** (item 3 below). Root-caused; needs a choice
-   between `OMP_NUM_THREADS=1` and subprocess encoding. It is the only known
-   issue that can take down the whole server.
-4. **Promote the verified carve into the cache** (item 2 below) — cheap to
-   describe, ~50 min of re-embed, so pair it with something else.
+1. **Fix the FAISS/OpenMP segfault** (item 3 below). Root-caused; needs a choice
+   between `OMP_NUM_THREADS=1` and subprocess encoding. Now the only known issue
+   that can take down the whole server, and the only remaining blocker-class bug.
+2. **Promote the verified carve into the cache** (item 2 below). Much cheaper
+   than it used to be — the carve itself is now ~2 min, so the cost is just the
+   ~50 min re-embed, and that is the same work item as (1) if you move encoding
+   into a subprocess anyway.
+3. **Parallelise EVTX with a process pool** (item 1 below). It is 83% of a carve
+   and it is the only thing left that is slow. Optional: a 106s carve is not a
+   problem anyone is complaining about.
+4. **Retrain or retire the anomaly model** (item 5 below). Still fires on 30% of
+   artifacts; the biggest *quality* gap left, now that speed is handled.
 
-**Method note that paid off twice this session:** when a rewrite changes a count,
-reproduce the old implementation and diff the actual sets rather than reasoning
-about whether the delta is benign. Doing that cost ~2.7h of background runtime
-and caught 67 silently-lost paths, including real evidence in the suspect's temp
-directory, that "looks equivalent to me" would have shipped.
+**Method note that has now paid off three times:** when a rewrite changes a
+count — or when you believe it changes nothing — diff the actual sets rather
+than reasoning about whether the delta is benign. It caught 67 silently-lost
+paths last session, and this session it is the only reason the `walk_filesystem`
+change could be shipped as byte-identical rather than hoped to be.
+
+**And a second one, new:** re-measure after a fix instead of carrying the old
+number forward. Two of this session's three findings were just *stale figures* —
+the extractor phase was recorded at ~1,070s when it was really 67s, and the
+concurrency decision had been made against those wrong numbers.
 
 ---
 
@@ -92,7 +98,8 @@ Real evidence used throughout (both gitignored, sitting in the repo root):
   opened. Errors out correctly via the existing "Split E01 Image Detected" guard.
   Not a bug; get the remaining segments if you want to use it.
 
-Carve is slow. Background it and redirect output. Timings: see 'Concurrency' below.
+Carve is ~107s (Win7) / ~22s (NIST) warm; background it anyway and redirect
+output. Timings: see 'Extractor profile' and 'Concurrency' below.
 Scratch scripts used this session (re-create as needed): a carve-and-pickle
 runner, an EVTX-only runner, and a citation end-to-end harness.
 
@@ -291,6 +298,49 @@ path lookup survives only as a last resort for a filesystem exposing no inodes
 (the test fakes); it is unreachable on a real image. **If you remove it, 10 tests
 fail** — `FakeFS` has no `as_directory()`.
 
+### Extractor profile + the last two path probes (`8d1ec36`)
+
+The extractor phase had never been profiled. `profile_extractors.py` (session
+scratchpad) runs all 16 extractors serially, each against its own TSK handle
+wrapped in a proxy that counts every `open_dir`/`open` **split by how it
+resolves** — path string vs inode. Call counts are the useful output; they are
+cache-independent, which wall-clock here is emphatically not.
+
+Serial, cold, whole phase: **NIST 67.3s, Win7 333.1s.**
+
+| phase | Win7 | NIST | note |
+|---|---:|---:|---|
+| EVTX | **277.6s** | 1.8s | 83% of Win7; only 0.3s of it is TSK |
+| FILESYSTEM | 27.1s | 30.7s | 17.4s of Win7 was 34 path probes |
+| SYSTEM | 11.1s | 5.7s | |
+| PATH_INDEX | 8.3s | 11.3s | already fixed in `325d9df` |
+| SRUM | 0.1s | 5.8s | 7 failed path opens on XP |
+| *other 12* | ≤3.2s | ≤1.7s | |
+
+Two survivors of the `325d9df` path-string bug, both now fixed:
+
+- `walk_filesystem` probed UNDEF-typed entries with `fs.open_dir(path)`. 34
+  probes, 512ms each, **17.4s of a 27.1s walk** — and every one was a deleted
+  `Content.IE5` cache file with no inode and no live twin, so every probe
+  returned nothing. `build_path_index` had already solved this case
+  (`as_directory()`, then a live twin's inode) and **never** resolves an UNDEF
+  entry by path; `walk_filesystem` had simply never been aligned with it.
+  A probe that cannot succeed is pure cost.
+- `extract_srum_data` probed 7 hardcoded case variants of `SRUDB.dat` *before*
+  consulting the path index it is already handed. All 7 fail on an image with no
+  SRUM at ~800ms each. Index first now; 7 path opens → 0.
+
+Verified by set diff, not by eye: walk output byte-identical on both images —
+5,262 paths (Win7), 6,168 (NIST), zero added, zero lost, zero dir/file
+reclassifications.
+
+**Checked and *not* a bug:** `extract_recent_documents` (L1654) and
+`extract_browser_history` (L1001) call `open_dir` while iterating `users_dir`,
+which is the truncation pattern three other extractors were fixed for. Tested
+directly on both images: 7/7 profile entries survive in each. Profile
+directories are small enough to stay resident, so it does not reproduce. Left
+alone deliberately — noted here so the next reader doesn't re-investigate it.
+
 ### CI
 `.github/workflows/tests.yml` exists **locally but is NOT pushed** — the PAT lacks
 `workflow` scope. `.github/` is gitignored to stop it being re-staged.
@@ -319,7 +369,46 @@ The pattern in all three: a number was quoted from a row count or a single
 observation without a second, independent check. Prefer distinct counts, and
 prefer an external reference image over self-assessment.
 
-### 1. Concurrency still corrupts libtsk (highest priority)
+### 1. Concurrency — DECIDED: the carve is serial (`CARVE_MAX_WORKERS=1`)
+
+**Resolved.** The default is now `1`. Threading was measured against serial on
+both reference images, through `carve_evidence_from_image` rather than a
+harness, and it loses on both axes:
+
+| | Win7 `Image.E01` | | NIST XP | |
+|---|---:|---:|---:|---:|
+| | **serial** | 14 workers | **serial** | 14 workers |
+| wall | **106.5s** | 112.8s | 21.8s | **20.0s** |
+| total rows | **80,191** | 79,853 | **30,017** | 29,935 |
+| EVTX | **17,336** | 17,001 | 0 (XP) | 0 |
+| PREFETCH | **81**† | 81 | **81** | **0** |
+
+† Win7 prefetch is 5; the 81 figure is the NIST column.
+
+Threading is **slower on the image that matters** and loses evidence on both.
+On Win7 it dropped 6 EVTX channels to `$IDX_ROOT not found`
+(`Diagnosis-PLA`, `Diagnosis-Scheduled`, `Winlogon`, `Kernel-WHEA`,
+`Diagnosis-DPS`, `RestartManager`) plus 2 ACTIVITY and 1 COMMUNICATION row. On
+NIST it lost **all 81 prefetch rows** — which is not an abstract loss:
+**NIST Q16 is answered through prefetch** (Ethereal and NetStumbler are found
+nowhere else), so a threaded carve regresses the external validation from 11/11.
+
+It loses on speed because the phase is **83% EVTX parsing**, and that is pure
+Python under the GIL — `python-evtx` builds an XML string per record and
+re-parses it with ElementTree (~16ms × 17,336 records). Threads cannot overlap
+that with anything but libtsk's C calls, while still paying for 16 extra image
+handles and the contention that corrupts libtsk in the first place.
+
+**The way to actually parallelise a carve is a process pool over the 65 EVTX
+files**, not over the 16 extractors. That is real work — the task closures
+(`isolated(fn)`) aren't picklable, so it needs module-level workers taking
+`(task_name, image_path, offset)` — but it is the only remaining speedup worth
+having, and it sidesteps libtsk's process-global state instead of fighting it.
+
+Everything below is the original analysis, kept because the reasoning is the
+reusable part.
+
+### 1a. Concurrency corrupts libtsk (historical)
 Per-task FS handles (`open_fs()` / `isolated()` in `extractors.py`) fixed the
 *worst* of it — BROWSER, COMMUNICATION, PREFETCH and RECYCLE all come back, and
 EXECUTION (492) / DELETED (663 distinct) are stable. **But it is not fully fixed.**
@@ -351,18 +440,17 @@ corruption problem disappears." But 12,614 paths in 4,146s is 329 ms per path,
 which is not what a directory walk costs. It was the path-string probe; see
 'Path resolution by inode' above. The index is now 3.7s.
 
-**So the decision is open again, and the arithmetic is inverted:** extraction is
-now ~99% of a carve of roughly 18 minutes, so worker count matters and serial no
-longer gets the corruption fix for free. **Re-measure threaded vs serial on the
-fixed walk before choosing a default.** Note the extractor phase has never been
-profiled — it very likely contains more path-string resolution of the same kind,
-and fixing that may make serial shippable on its own.
+That reopened the decision, on the reading that extraction was now ~99% of a
+roughly 18-minute carve. **That reading was wrong, and for an avoidable reason:
+the ~1,070s extractor figure was measured *before* `325d9df`, and nobody
+re-measured it after.** `walk_filesystem` got the inode fix in that same commit,
+so the extractors had already sped up along with the walk. Profiled properly
+(`profile_extractors.py`, session scratchpad — wraps the TSK handle and counts
+every call by how it resolves), the phase is **67.3s on NIST and 333.1s on
+Win7**, not 1,070s. See 'Extractor profile' under Done.
 
-If threading is still needed and `$IDX_ROOT` corruption persists, move to
-`ProcessPoolExecutor` for true isolation (libtsk keeps process-global state,
-which is why per-thread handles could not fix it). The task closures
-(`isolated(fn)`) aren't picklable, so this needs module-level workers taking
-`(task_name, image_path, offset)`.
+The lesson is cheap to state and was expensive to learn twice: **a figure
+measured before a fix is not evidence about the code after it.**
 
 ### 2. Promote the good carve into the cache
 `src/cache/<sha256>/artifacts.pkl` still holds the **old racy carve** (80,554
@@ -372,9 +460,9 @@ invalidates the cached FAISS index — forcing a ~50-minute re-embed. Do it
 deliberately, and delete the stale `faiss.index` at the same time.
 
 Scratchpad pickles from past sessions (`recarve2.pkl`, `nist_carve.pkl`) are
-**gone** — scratchpads are per-session. Re-carve to regenerate; with the walk
-fixed that is now ~18 min rather than ~2h, so this is much cheaper than the note
-above previously implied.
+**gone** — scratchpads are per-session. Re-carve to regenerate; that is now
+**~107s on Win7 and ~22s on NIST**, so the carve is no longer any part of the
+cost of this item. The ~50-minute re-embed is the whole cost.
 
 ### 3. Segfault during FAISS index build — root cause found, no fix applied
 The citation harness segfaulted **3 times in a row** inside torch's BERT forward
@@ -448,6 +536,16 @@ have no hive. Only `Jimmy Wilson` does. Don't chase this.
   this project has been too generous. The NIST image found three bugs in one
   evening that months of testing against `Image.E01` never surfaced, because a
   single test image only exercises the paths that image happens to use.
+- **Time a carve cold, or count calls instead.** The OS caches the decoded E01,
+  so a second run of the same walk is 2-3x faster for no reason of yours —
+  `walk_filesystem` measured 27.1s cold and 8.8s warm on the same code. When
+  comparing implementations, either compare warm-to-warm, or measure something
+  cache-independent: the number of `open_dir(path)` calls is the honest metric
+  here, since each one is a directory scan whether or not the blocks are cached.
+- **A figure measured before a fix is not evidence about the code after it.**
+  The extractor phase sat in this document at ~1,070s while it was really 67s;
+  the same commit that fixed the walk had sped the extractors up too. A whole
+  decision (`CARVE_MAX_WORKERS`) was made twice against that stale number.
 - **Count distinct things, not rows.** Two inflated figures shipped here because
   `len(df)` was reported as an artifact count.
 - **Don't trust a clean run.** Nearly every bug here only appeared against the
