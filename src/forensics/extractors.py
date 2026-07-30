@@ -1310,11 +1310,20 @@ def walk_filesystem(fs, limit=150000, max_depth=14):
                         meta.size if meta and meta.size else 0,
                         _is_deleted(entry),
                         _meta_addr(entry),
+                        entry,
                     ))
                 except Exception:
                     continue
 
-            for name, ntype, meta_type, m_time, size, deleted, addr in listing:
+            # Inode per name, taken from whichever listing of it actually has
+            # one, so a copy listed with meta_addr 0 can borrow it. Same two
+            # failure modes build_path_index documents.
+            name_addr = {}
+            for _n, _nt, _mt, _mtime, _sz, _del, _addr, _e in listing:
+                if _addr and _n not in name_addr:
+                    name_addr[_n] = _addr
+
+            for name, ntype, meta_type, m_time, size, deleted, addr, entry in listing:
                 if len(records) >= limit:
                     return
                 try:
@@ -1332,10 +1341,23 @@ def walk_filesystem(fs, limit=150000, max_depth=14):
                     # the meta_addr-0 copy; without this the directory is filed
                     # as a plain file and its contents never walked.
                     if child is None and not addr and ntype not in (1, 2):
+                        # Ask the entry we already hold, then the inode a live
+                        # twin of the same name resolved with — the two routes
+                        # build_path_index uses here, and deliberately the only
+                        # two. It never resolves an UNDEF entry by path, because
+                        # TSK answers a path by scanning every parent in turn:
+                        # 34 such probes were 17.4s of a 27.1s walk on the Win7
+                        # image, every one of them a deleted Content.IE5 cache
+                        # file with no inode and no live twin, and every one
+                        # returning nothing. A probe that cannot succeed is pure
+                        # cost, so the walk now concludes 'not a directory' from
+                        # the entry itself, exactly as the shared index does.
                         try:
-                            child = fs.open_dir(fpath)
+                            child = entry.as_directory()
                         except Exception:
                             child = None
+                        if child is None:
+                            child = _open_dir_by_inode(fs, name_addr.get(name))
                     if not is_dir and ntype not in (1, 2):
                         is_dir = child is not None
                     ext = os.path.splitext(name)[1].lower() if is_file else ''
@@ -1570,6 +1592,16 @@ def extract_srum_data(fs, index=None):
         "/WINDOWS/System32/SRU/SRUDB.DAT",
         "/windows/system32/sru/srudb.dat",
     ]
+
+    # Every one of those probes is a full path resolution, and on an image with
+    # no SRUM all seven fail — each scanning its parent directories to the end
+    # before concluding, ~800ms apiece on the XP image. The shared index already
+    # lists every path, and each candidate above sits at depth 4 in a directory
+    # the index never skips, so if it holds no SRUDB.dat the probes cannot find
+    # one either. The heuristic search below still runs, so nothing is lost.
+    if index is not None and not match_path_index(
+            index, [r'^SRUDB\.dat$'], start_path="/", max_depth=14):
+        srum_paths = []
 
     for srum_path in srum_paths:
         try:
