@@ -1,6 +1,7 @@
 # Vigilance-Core — Progress & Handoff
 
-Working notes for continuing this project. Last updated after the extraction-integrity pass.
+Working notes for continuing this project. Last updated after the walk-performance pass
+(`325d9df`), which cut the carve from 87 minutes to roughly 18.
 
 Repo: `holialli/Vigilance-Core` (branch `main`). 122 tests passing (`python -m pytest tests/ -q`).
 
@@ -10,6 +11,36 @@ coverage; competing on the AI/triage layer Autopsy doesn't have.
 
 > Push with a transient auth header built from `GITHUB_TOKEN` in `src/.env`
 > (`git -c http.extraheader=...`); never write it to git config.
+
+---
+
+## Start here
+
+**State:** clean. `main` at `325d9df`, working tree clean, 122 tests passing,
+NIST re-validated 11/11 through a full carve. Nothing is half-finished.
+
+**In flight:** nothing. The last session ended on a committed, verified change.
+
+**Next, in the order I'd do it:**
+
+1. **Profile the extractor phase.** ~1,070s and never profiled. The shared walk
+   turned out to be 79% of a carve and 99% of *that* was one bad line
+   (`fs.open_dir(path_string)`); the extractors call into the same API and very
+   likely repeat it. Grep the extractors for `open_dir(` and `open(` taking a
+   path, and time one extractor before assuming. Highest expected value.
+2. **Then re-decide `CARVE_MAX_WORKERS`** (item 1 below). Do this *after* (1) —
+   (1) changes the numbers the decision rests on, exactly as it already did once.
+3. **Fix the FAISS/OpenMP segfault** (item 3 below). Root-caused; needs a choice
+   between `OMP_NUM_THREADS=1` and subprocess encoding. It is the only known
+   issue that can take down the whole server.
+4. **Promote the verified carve into the cache** (item 2 below) — cheap to
+   describe, ~50 min of re-embed, so pair it with something else.
+
+**Method note that paid off twice this session:** when a rewrite changes a count,
+reproduce the old implementation and diff the actual sets rather than reasoning
+about whether the delta is benign. Doing that cost ~2.7h of background runtime
+and caught 67 silently-lost paths, including real evidence in the suspect's temp
+directory, that "looks equivalent to me" would have shipped.
 
 ---
 
@@ -34,6 +65,10 @@ image **and an answer key** (`TestAnswers.pdf`, 31 questions). Both segments
 | 12-15, 17-27, 29, 31 | mail/IRC config, packet capture, AV | **out of scope** — capabilities this tool does not claim |
 
 Re-run with the harness in the session scratchpad (`validate_nist.py`).
+
+**Re-validated end-to-end after the recycle-bin fixes: 11/11.** That run carved
+the image from scratch rather than loading a pickle, so Q28 is confirmed through
+a full carve and not just a direct parser test.
 
 **Three bugs this image found that the local Windows 7 image never could:**
 - Multi-segment E01 sets were **entirely unopenable** (`8a62634`).
@@ -215,6 +250,47 @@ are now collapsed instead of double-counted.
 `tests/test_extractors.py` uses a fake filesystem reproducing the truncation
 semantics; **4 of its 5 tests fail against the previous code.**
 
+### Path resolution by inode (`325d9df`) — 1,109x on the shared walk
+
+**Never ask TSK a question by path string inside a walk.** Both walks decided
+"is this entry a directory?" with `fs.open_dir(path_string)`. TSK answers that by
+scanning each parent directory's entries in turn, so cost tracks **parent size,
+not depth** — and a probe that *fails* scans the parent to the end before
+concluding. Failing is the normal case, because the caller is usually asking
+about a file.
+
+Measured on the NIST image:
+
+| operation | cost |
+|---|---:|
+| `open_dir(path)` on `/WINDOWS/system32/notepad.exe` (1,794-entry parent) | 196 ms |
+| `open_dir(path)` on `/WINDOWS/system32/config/SAM` | 148 ms |
+| `open_dir(inode=)` | ~0 ms |
+| entries that are type-UNDEF and need the probe | 26% |
+
+`/WINDOWS/system32` alone cost ~84s. Whole shared index: **4,145.6s → 3.7s.**
+`walk_filesystem` hid the same bug only because it skips `system32` and
+`program files` outright — which is also why FILESYSTEM misses those files.
+
+**Verified byte-exact**, not just "looks right": the previous implementation was
+re-run on the same image (9,691s) and the two path sets diffed — 12,614 both
+ways, zero added, zero lost, zero dir/file disagreements. That diff was worth
+the runtime; a naive inode swap silently lost 67 paths in two distinct ways:
+
+- A name can list **twice under one dedup key**, with `meta_addr` 0 on the copy
+  dedup keeps. `wizdata.dat` and `~DF99EB.tmp` both do. Both were filed as plain
+  files, discarding an ARJ archiver toolset in the suspect's temp directory.
+  Dedup now takes the inode from whichever copy has one.
+- A name can list **twice under different keys** (differing `meta_type`), so both
+  survive dedup and the stale copy has no inode at all. It now borrows its live
+  twin's, instead of one path being reported as a directory and then as a file.
+
+`entry.as_directory()` answers from the entry object already in hand, with no
+lookup of any kind — it is the reason this lands at 3.7s instead of 302s. The
+path lookup survives only as a last resort for a filesystem exposing no inodes
+(the test fakes); it is unreachable on a real image. **If you remove it, 10 tests
+fail** — `FakeFS` has no `as_directory()`.
+
 ### CI
 `.github/workflows/tests.yml` exists **locally but is NOT pushed** — the PAT lacks
 `workflow` scope. `.github/` is gitignored to stop it being re-staged.
@@ -255,8 +331,6 @@ With error reporting now in place, a 14-worker carve visibly fails with
 event-log evidence, lost nondeterministically.
 
 `CARVE_MAX_WORKERS` was added so a carve can be made reproducible (`1` = serial).
-Serial was 7,194s (2h0m) against ~19 min threaded — but that measurement predates
-the shared path index.
 
 **Step 1 is done** (`693ac74`). `heuristic_discover_files` used to walk the whole
 image per call, with four extractors calling it. `build_path_index()` now walks
@@ -264,10 +338,25 @@ once and every caller filters:
 
     per-caller walks  4,053.7s   ->   shared index  1,157.6s   (3.5x)
 
-**Step 2 is still open: re-measure a threaded carve and pick the default.**
-Discovery was 4,053s of the 7,194s serial total, so serial should now land near
-~70 min — possibly close enough to threaded that serial becomes shippable, which
-would resolve the corruption problem outright. Measure before deciding.
+**Step 2 is done, and it reversed the conclusion twice.** A full serial carve of
+the NIST image (`CARVE_MAX_WORKERS=1`) came in at **5,215.4s (87 min)**, split:
+
+| phase | time | share |
+|---|---:|---:|
+| shared path index (single-threaded) | 4,145.6s | **79%** |
+| all 16 extractors, serial | ~1,070s | 21% |
+
+That first said "extractor concurrency cannot matter — ship serial and the
+corruption problem disappears." But 12,614 paths in 4,146s is 329 ms per path,
+which is not what a directory walk costs. It was the path-string probe; see
+'Path resolution by inode' above. The index is now 3.7s.
+
+**So the decision is open again, and the arithmetic is inverted:** extraction is
+now ~99% of a carve of roughly 18 minutes, so worker count matters and serial no
+longer gets the corruption fix for free. **Re-measure threaded vs serial on the
+fixed walk before choosing a default.** Note the extractor phase has never been
+profiled — it very likely contains more path-string resolution of the same kind,
+and fixing that may make serial shippable on its own.
 
 If threading is still needed and `$IDX_ROOT` corruption persists, move to
 `ProcessPoolExecutor` for true isolation (libtsk keeps process-global state,
@@ -278,22 +367,48 @@ which is why per-thread handles could not fix it). The task closures
 ### 2. Promote the good carve into the cache
 `src/cache/<sha256>/artifacts.pkl` still holds the **old racy carve** (80,554
 rows, no BROWSER/EXECUTION/COMMUNICATION). The verified serial carve (89,247
-rows) is sitting in the session scratchpad as `recarve2.pkl` and was **not**
-promoted, because replacing it changes `embed_df` size and invalidates the
-cached FAISS index — forcing a ~50-minute re-embed. Do it deliberately, and
-delete the stale `faiss.index` at the same time.
+rows) was never promoted, because replacing it changes `embed_df` size and
+invalidates the cached FAISS index — forcing a ~50-minute re-embed. Do it
+deliberately, and delete the stale `faiss.index` at the same time.
 
-### 3. Segfault during FAISS index build — unresolved
+Scratchpad pickles from past sessions (`recarve2.pkl`, `nist_carve.pkl`) are
+**gone** — scratchpads are per-session. Re-carve to regenerate; with the walk
+fixed that is now ~18 min rather than ~2h, so this is much cheaper than the note
+above previously implied.
+
+### 3. Segfault during FAISS index build — root cause found, no fix applied
 The citation harness segfaulted **3 times in a row** inside torch's BERT forward
 (`transformers/activations.py`) while encoding ~2.3k texts, always during index
-*build*. `OMP_NUM_THREADS=1` made it pass. It later passed *without* the cap —
-but that run loaded a cached index and never re-encoded, so it is **not a clean
-retest**. Encoding 2,400 texts under heavy CPU load in isolation does *not*
-reproduce it.
+*build*. `OMP_NUM_THREADS=1` made it pass.
 
-Root cause unknown; **no fix applied.** Worth pinning down, because the app
-builds indexes in a background thread and supports concurrent investigators — a
-native crash there takes the whole Gradio server down.
+**Cause: three separate OpenMP runtimes loaded into one process.** Enumerated
+with `EnumProcessModules` at each import step:
+
+| runtime | loaded by |
+|---|---|
+| `vcomp140-55aba23c….dll` (MSVC) | `faiss_cpu.libs` — via `import faiss` at `rag.py:8`, **first** |
+| `libiomp5md.dll` (Intel) | `torch/lib` |
+| `vcomp140.dll` (MSVC, second copy) | `sklearn/.libs` |
+
+Mixing OpenMP runtimes is a documented cause of nondeterministic native crashes
+inside parallel regions, and it accounts for every observation on record: the
+crash lands in GELU (an OMP-parallel op), only during *encode* (the only heavy
+OMP workload), `OMP_NUM_THREADS=1` fixes it (no parallel region left to race in),
+and **isolated encoding does not reproduce it — because that test never imported
+faiss first.** `rag.py` imports faiss at module scope and `sentence_transformers`
+lazily inside the function, so faiss always wins the load order in the real app.
+
+Reproduce with `omp_check.py` (session scratchpad; note a substring match on
+"omp" also catches `_dec`**`omp`**`_*.pyd` and `_middle_term_c`**`omp`**`uter.pyd`
+— those are false positives, not runtimes).
+
+**No fix applied — it needs a call:**
+- `OMP_NUM_THREADS=1` before any import — known to work, costs ~4x on encode.
+- **Encode in a subprocess — recommended.** A native crash then cannot take the
+  Gradio server down, which is the actual risk given background index builds plus
+  concurrent investigators.
+- Import ordering alone — cheap, but does not remove the duplicate runtimes;
+  don't trust it by itself.
 
 ### 5. The ML model is close to useless as-is
 `AnomalyScore == -1` fires on **30.1%** of artifacts (23,068 / 76,693) on the
