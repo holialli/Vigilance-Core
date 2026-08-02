@@ -1,10 +1,12 @@
 # Vigilance-Core — Progress & Handoff
 
 Working notes for continuing this project. Last updated after profiling the
-extractor phase, which closed the concurrency question: **the carve is serial by
-default now**, and a full carve of the NIST image is ~22s, not 87 minutes.
+extractor phase, which closed the concurrency question — **the carve is serial by
+default now**, and a full carve of the NIST image is ~22s, not 87 minutes — and
+after moving FAISS index encoding into a child process so its segfault can no
+longer take the server down.
 
-Repo: `holialli/Vigilance-Core` (branch `main`). 122 tests passing (`python -m pytest tests/ -q`).
+Repo: `holialli/Vigilance-Core` (branch `main`). 129 tests passing (`python -m pytest tests/ -q`).
 
 **Goal:** conversational forensics — an investigator asks questions in natural language
 instead of manually hunting through artifacts. Not trying to match Autopsy's parser
@@ -17,22 +19,22 @@ coverage; competing on the AI/triage layer Autopsy doesn't have.
 
 ## Start here
 
-**State:** clean. `main` at `7e6b9c5`, working tree clean, 122 tests passing,
+**State:** clean. `main` at `f89313e`, working tree clean, 129 tests passing,
 NIST re-validated 11/11 through a full carve. Nothing is half-finished.
 
 **In flight:** nothing. The last session ended on a committed, verified change.
 
 **Next, in the order I'd do it:**
 
-1. **Fix the FAISS/OpenMP segfault** (item 3 below). Root-caused; needs a choice
-   between `OMP_NUM_THREADS=1` and subprocess encoding. Now the only known issue
-   that can take down the whole server, and the only remaining blocker-class bug.
-2. **Promote the verified carve into the cache** (item 2 below). Much cheaper
-   than it used to be — the carve itself is now ~2 min, so the cost is just the
-   ~50 min re-embed, and that is the same work item as (1) if you move encoding
-   into a subprocess anyway.
+1. **Promote the verified carve into the cache** (item 2 below). The carve is
+   now ~107s, so the cost is just the ~50 min re-embed — and the re-embed is
+   worth doing *now* as the first real exercise of the subprocess encoder at
+   full scale (62k texts vs the 2k tested). Watch for how often it retries.
+2. **Get faiss/torch/sklearn onto one OpenMP runtime** (item 3 below). The
+   subprocess fix contains the segfault but does not remove it; this is the only
+   thing that actually removes it, and it is an environment change, not code.
 3. **Parallelise EVTX with a process pool** (item 1 below). It is 83% of a carve
-   and it is the only thing left that is slow. Optional: a 106s carve is not a
+   and it is the only thing left that is slow. Optional: a 107s carve is not a
    problem anyone is complaining about.
 4. **Retrain or retire the anomaly model** (item 5 below). Still fires on 30% of
    artifacts; the biggest *quality* gap left, now that speed is handled.
@@ -140,6 +142,7 @@ src/forensics/
   extractors.py   all extract_*, walk_filesystem, carve orchestrator  (~1780 lines)
   ml.py           engineer_features, lazy model load
   rag.py          hybrid retrieval + citations
+  embedding.py    sentence embedding; bulk encode isolated in a subprocess
   context.py      extract_system_context
   llm.py          Ollama → Groq → Gemini → offline chain
   reporting.py    PDF
@@ -469,34 +472,57 @@ The citation harness segfaulted **3 times in a row** inside torch's BERT forward
 (`transformers/activations.py`) while encoding ~2.3k texts, always during index
 *build*. `OMP_NUM_THREADS=1` made it pass.
 
-**Cause: three separate OpenMP runtimes loaded into one process.** Enumerated
-with `EnumProcessModules` at each import step:
+**Cause: multiple OpenMP runtimes loaded into one process.** Re-enumerated with
+`EnumProcessModules` at each import step. **There are four, not three** — the
+earlier count missed one of torch's:
 
 | runtime | loaded by |
 |---|---|
 | `vcomp140-55aba23c….dll` (MSVC) | `faiss_cpu.libs` — via `import faiss` at `rag.py:8`, **first** |
 | `libiomp5md.dll` (Intel) | `torch/lib` |
+| `libiompstubs5md.dll` (Intel) | `torch/lib` |
 | `vcomp140.dll` (MSVC, second copy) | `sklearn/.libs` |
 
 Mixing OpenMP runtimes is a documented cause of nondeterministic native crashes
 inside parallel regions, and it accounts for every observation on record: the
 crash lands in GELU (an OMP-parallel op), only during *encode* (the only heavy
-OMP workload), `OMP_NUM_THREADS=1` fixes it (no parallel region left to race in),
-and **isolated encoding does not reproduce it — because that test never imported
-faiss first.** `rag.py` imports faiss at module scope and `sentence_transformers`
-lazily inside the function, so faiss always wins the load order in the real app.
+OMP workload), and `OMP_NUM_THREADS=1` fixes it (no parallel region left to race
+in).
 
-Reproduce with `omp_check.py` (session scratchpad; note a substring match on
-"omp" also catches `_dec`**`omp`**`_*.pyd` and `_middle_term_c`**`omp`**`uter.pyd`
-— those are false positives, not runtimes).
+**Correction to the earlier note:** it said isolated encoding "does not
+reproduce it — because that test never imported faiss first." That is wrong. A
+faiss-free child process reproduces the crash roughly half the time. Dropping
+faiss removes one runtime of four; the remaining three still conflict. Measured
+on 2,000 real artifact texts:
 
-**No fix applied — it needs a call:**
-- `OMP_NUM_THREADS=1` before any import — known to work, costs ~4x on encode.
-- **Encode in a subprocess — recommended.** A native crash then cannot take the
-  Gradio server down, which is the actual risk given background index builds plus
-  concurrent investigators.
-- Import ordering alone — cheap, but does not remove the duplicate runtimes;
-  don't trust it by itself.
+| where | result |
+|---|---|
+| in-process, faiss loaded (the old path) | **segfault 3 / 3 runs** |
+| child process, no faiss | segfault ~1 / 2 runs |
+
+**Watch the probe itself.** The first enumeration reported *zero* runtimes
+everywhere, which looks like a clean bill of health and is really a broken
+measurement: `ctypes` truncates the 64-bit `HANDLE` from `GetCurrentProcess`
+unless you set `restype`/`argtypes`, so `EnumProcessModules` quietly returns
+nothing. Make the probe raise when it enumerates nothing. (Also note a substring
+match on "omp" catches `_dec`**`omp`**`_*.pyd` and
+`_middle_term_c`**`omp`**`uter.pyd` — false positives, not runtimes.)
+
+**Fixed in `f89313e`:** bulk encoding moved into a child process
+(`src/forensics/embedding.py`). This **contains** the crash rather than
+preventing it — the child still crashes sometimes, but it exits with a status
+the parent catches instead of killing the Gradio server. Four fast retries
+usually get through; the fifth sets `OMP_NUM_THREADS=1`, removing the race at
+~10x encode cost. It never falls back to encoding in the parent. Verified
+bit-identical to in-process encoding (max abs diff 0.0, min cosine 1.0 over 400
+real texts), so retrieval is unchanged.
+
+**Still open, deliberately:** query embedding stays in-process (one short string,
+never observed crashing; a subprocess per query would add a model load to every
+question). `FORENSICS_EMBED_IN_PROCESS=1` disables subprocessing entirely.
+**The durable fix is environmental** — get faiss, torch and sklearn onto a single
+OpenMP runtime (matching wheels, or a conda-forge stack). Until then the code
+only contains the damage.
 
 ### 5. The ML model is close to useless as-is
 `AnomalyScore == -1` fires on **30.1%** of artifacts (23,068 / 76,693) on the
@@ -546,6 +572,11 @@ have no hive. Only `Jimmy Wilson` does. Don't chase this.
   The extractor phase sat in this document at ~1,070s while it was really 67s;
   the same commit that fixed the walk had sped the extractors up too. A whole
   decision (`CARVE_MAX_WORKERS`) was made twice against that stale number.
+- **Make a probe fail loudly when it measures nothing.** The OpenMP enumeration
+  reported zero runtimes in every process — indistinguishable from "no problem
+  here", and actually a truncated Win32 handle returning an empty list. A
+  diagnostic that can return a clean-looking null result is worse than none; it
+  now raises if it enumerates nothing.
 - **Count distinct things, not rows.** Two inflated figures shipped here because
   `len(df)` was reported as an artifact count.
 - **Don't trust a clean run.** Nearly every bug here only appeared against the
