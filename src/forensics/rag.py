@@ -2,16 +2,13 @@
 
 import os
 import re
-import threading
 import time
 
 import faiss
 import numpy as np
 
 from .config import CACHE_DIR
-
-ai_model = None
-_ai_model_lock = threading.Lock()
+from .embedding import encode_bulk, encode_query
 
 # Bulk types are embedded into FAISS. FILESYSTEM is excluded: its MFT dump is far
 # too large and repetitive to embed usefully, and file-count questions are served
@@ -82,8 +79,6 @@ def _normalize_for_embedding(txt: str) -> str:
     return txt.strip()
 
 def build_rag_context(query, session, top_k=8):
-    global ai_model
-
     if session.current_audit_df is None:
         return [], ""
 
@@ -95,12 +90,6 @@ def build_rag_context(query, session, top_k=8):
     lexical_df = session.current_audit_df[types_upper.isin(LEXICAL_TYPES)].copy()
     lexical_df = lexical_df.drop_duplicates(subset=['Task Category']).reset_index(drop=True)
     # ─────────────────────────────────────────────────────────────────────────
-
-    from sentence_transformers import SentenceTransformer
-
-    with _ai_model_lock:
-        if ai_model is None:
-            ai_model = SentenceTransformer('all-MiniLM-L6-v2')
 
     with session.faiss_lock:
         if session.faiss_index is None:
@@ -137,14 +126,11 @@ def build_rag_context(query, session, top_k=8):
                 # Normalize to collapse volatile tokens and improve cache hits
                 normalized_texts = [_normalize_for_embedding(t) for t in unique_texts]
 
-                # ── REQ: num_workers removed — not supported by this ST version ──
-                unique_embeddings = ai_model.encode(
-                    normalized_texts,
-                    batch_size=256,
-                    show_progress_bar=False,
-                    convert_to_numpy=True,
-                )
-                # ─────────────────────────────────────────────────────────────
+                # Encoded in a child process that never imports faiss: three
+                # OpenMP runtimes in one process crash this call nondeterminist-
+                # ically, and a segfault here would take the Gradio server down
+                # with it rather than failing this one build. See embedding.py.
+                unique_embeddings = encode_bulk(normalized_texts, batch_size=256)
 
                 # Map unique embeddings back to the full filtered series
                 text_to_idx = {text: i for i, text in enumerate(unique_texts)}
@@ -192,7 +178,7 @@ def build_rag_context(query, session, top_k=8):
 
     scored = []  # (score, source_df, positional_index)
 
-    query_vec = ai_model.encode([query], convert_to_numpy=True)
+    query_vec = encode_query(query)
     n_semantic = min(max(top_k * 8, 40), len(embed_df))
     distances, result_indices = session.faiss_index.search(
         np.array(query_vec).astype('float32'), k=n_semantic
