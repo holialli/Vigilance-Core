@@ -23,3 +23,11 @@ def test_fresh_session_defaults():
     assert s.faiss_index is None
     assert s.image_hash_sha256 is None
     assert s.cached_system_facts is None
+    assert s.index_error is None
+
+
+def test_index_error_is_per_session():
+    """A failed build on one case must not mark another case broken."""
+    a, b = CaseSession(), CaseSession()
+    a.index_error = "boom"
+    assert b.index_error is None

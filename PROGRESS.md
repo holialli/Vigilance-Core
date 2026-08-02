@@ -172,7 +172,7 @@ src/forensics/
   WORDs — without that the parser returns 0).
 - **Deleted/orphaned files**: recovered via TSK unalloc flags + `$OrphanFiles`.
   Originally reported as "1,334 recovered" — **that was wrong**, see the
-  double-counting fix below. The true figure on this image is **663**.
+  double-counting fix below. The true figure on this image is **666** (see item 2).
 - **Hash sets** (`hashsets.py`): MD5+SHA-256 in one pass, NSRL-style loader.
   Skipped when no sets configured — it added ~22 min for zero benefit.
 - **Correlation engine** + **Leads** tab; **Case management** + **Cases** tab.
@@ -357,7 +357,7 @@ alone deliberately — noted here so the next reader doesn't re-investigate it.
 Three numbers in earlier versions of this document were wrong. They are
 corrected in place above; recorded here so the same mistakes are not repeated.
 
-- **"1,334 deleted files recovered" → 663.** `walk_filesystem` walked `/Users`,
+- **"1,334 deleted files recovered" → 666.** `walk_filesystem` walked `/Users`,
   `/USERS`, `/` and `/$OrphanFiles` as overlapping roots — TSK resolves the case
   variants to one directory and `/` covers the rest — recording the same file up
   to four times. FILESYSTEM was inflated 2.8x, DELETED 2.0x. A row count was
@@ -414,7 +414,7 @@ reusable part.
 ### 1a. Concurrency corrupts libtsk (historical)
 Per-task FS handles (`open_fs()` / `isolated()` in `extractors.py`) fixed the
 *worst* of it — BROWSER, COMMUNICATION, PREFETCH and RECYCLE all come back, and
-EXECUTION (492) / DELETED (663 distinct) are stable. **But it is not fully fixed.**
+EXECUTION (492) / DELETED (666 distinct) are stable. **But it is not fully fixed.**
 
 With error reporting now in place, a 14-worker carve visibly fails with
 `$IDX_ROOT not found` on `System.evtx`, `GroupPolicy`, `WindowsUpdateClient` and
@@ -455,19 +455,42 @@ Win7**, not 1,070s. See 'Extractor profile' under Done.
 The lesson is cheap to state and was expensive to learn twice: **a figure
 measured before a fix is not evidence about the code after it.**
 
-### 2. Promote the good carve into the cache
-`src/cache/<sha256>/artifacts.pkl` still holds the **old racy carve** (80,554
-rows, no BROWSER/EXECUTION/COMMUNICATION). The verified serial carve (89,247
-rows) was never promoted, because replacing it changes `embed_df` size and
-invalidates the cached FAISS index — forcing a ~50-minute re-embed. Do it
-deliberately, and delete the stale `faiss.index` at the same time.
+### 2. Promote the good carve into the cache — DONE
 
-Scratchpad pickles from past sessions (`recarve2.pkl`, `nist_carve.pkl`) are
-**gone** — scratchpads are per-session. Re-carve to regenerate; that is now
-**~107s on Win7 and ~22s on NIST**, so the carve is no longer any part of the
-cost of this item. The ~50-minute re-embed is the whole cost.
+`src/cache/6c18f662…/artifacts.pkl` (the IACIS Win7 case) held the **old racy
+carve**, and a cache hit served it straight to the investigator. Promoted a
+fresh serial carve through the app's own path — `carve_evidence_from_image` →
+`engineer_features` → `save_case` — so the file is exactly what the app would
+have written on a miss. Carve took 163s.
 
-### 3. Segfault during FAISS index build — root cause found, no fix applied
+| ArtifactType | cached | fresh | |
+|---|---:|---:|---|
+| BROWSER | 0 | **73** | was missing entirely |
+| EXECUTION | 0 | **492** | was missing entirely |
+| RECYCLE | 0 | **29** | was missing entirely |
+| COMMUNICATION | 0 | **28** | was missing entirely |
+| PREFETCH | 0 | **5** | was missing entirely |
+| EVTX | 15,620 | **17,336** | +1,716 (truncation fix) |
+| REGISTRY | 54,395 | **56,869** | +2,474 (truncation fix) |
+| ACTIVITY | 13 | 14 | |
+| FILESYSTEM | 9,109 | 4,596 | −4,513, expected: 2.8x dedup |
+| DELETED | 1,334 | 666 | −668, expected: 2.0x dedup |
+| **TOTAL** | 80,554 | **80,191** | |
+
+The total barely moves while five artifact types go from *nothing* to real
+evidence — which is exactly why a row count is a bad health check.
+
+Old file kept as `artifacts.pkl.racy-<timestamp>`; stale `faiss.index` (89 MB,
+built from the old embed set) deleted.
+
+**Correction:** this document said the true DELETED figure was 663. It is
+**666** on a current serial carve, stable across three runs.
+
+Note `artifacts.pkl.bak` in the same directory is a *different* older carve
+(71,900 rows — has BROWSER/COMMUNICATION but no FILESYSTEM/DELETED/EXECUTION).
+Neither backup is worth keeping once the promoted carve is confirmed good.
+
+### 3. Segfault during FAISS index build — FIXED (contained), see below
 The citation harness segfaulted **3 times in a row** inside torch's BERT forward
 (`transformers/activations.py`) while encoding ~2.3k texts, always during index
 *build*. `OMP_NUM_THREADS=1` made it pass.
@@ -572,6 +595,12 @@ have no hive. Only `Jimmy Wilson` does. Don't chase this.
   The extractor phase sat in this document at ~1,070s while it was really 67s;
   the same commit that fixed the walk had sped the extractors up too. A whole
   decision (`CARVE_MAX_WORKERS`) was made twice against that stale number.
+- **Don't edit `embedding.py` while an index build is running.** The child
+  re-executes that file from disk on *every* spawn, so an edit lands mid-run and
+  changes the behaviour of an operation already in flight. A missing `import re`
+  added during a build turned retries 3-5 of a 5-attempt run into `NameError`s
+  that looked exactly like more crashes, and destroyed the measurement. It is
+  the one real downside of running the encoder as a script rather than a module.
 - **Make a probe fail loudly when it measures nothing.** The OpenMP enumeration
   reported zero runtimes in every process — indistinguishable from "no problem
   here", and actually a truncated Win32 handle returning an empty list. A

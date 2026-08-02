@@ -38,6 +38,7 @@ def _activate_case(session, df, image_hash, artifact_counts):
     session.artifact_counts = artifact_counts
     session.cached_system_facts = None
     session.faiss_index = None  # Force index rebuild for new image
+    session.index_error = None
     session.correlation_db = build_correlations(df)
 
     def _background_index_build():
@@ -46,6 +47,10 @@ def _activate_case(session, df, image_hash, artifact_counts):
             build_rag_context("Init", session)
             print("  [FAISS] Background index build complete.")
         except Exception as e:
+            # Record it, don't just log it. This thread is the only thing that
+            # ever sets faiss_index, so a swallowed failure leaves the chat
+            # saying "still building" for the rest of the session.
+            session.index_error = str(e)
             print(f"  [FAISS] Background index build failed: {e}")
             if debug_extract:
                 traceback.print_exc()
@@ -479,10 +484,20 @@ def build_gui():
                 history.append({"role": "assistant", "content": reply})
                 return "", history
 
-            # Guard: FAISS index still building
+            # Guard: FAISS index absent — either still building, or it failed.
+            # Those need different words: one is "wait", the other is "this
+            # will never finish, here is why".
             if session.faiss_index is None:
-                reply = ("⏳ The forensic index is still building in the background. "
-                         "Please wait 15–30 seconds and try again.")
+                if session.index_error:
+                    reply = (
+                        "❌ The forensic index could not be built, so semantic "
+                        "search is unavailable for this case. Keyword Search, "
+                        "Timeline, Triage and Leads still work on the full "
+                        f"artifact set.\n\nReason: `{session.index_error}`"
+                    )
+                else:
+                    reply = ("⏳ The forensic index is still building in the background. "
+                             "Please wait 15–30 seconds and try again.")
                 history = list(history or [])
                 history.append({"role": "user",      "content": message})
                 history.append({"role": "assistant", "content": reply})

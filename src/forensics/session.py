@@ -14,3 +14,7 @@ class CaseSession:
         self.session_log = []
         self.correlation_db = None
         self.faiss_lock = threading.Lock()
+        # Why the index is absent. Without this a *failed* build is
+        # indistinguishable from one still running, and the chat tells the
+        # examiner to "wait 15-30 seconds" forever.
+        self.index_error = None

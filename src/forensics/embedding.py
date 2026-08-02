@@ -52,6 +52,7 @@ OMP_NUM_THREADS=1 for the whole app to remove the race at the cost of speed.
 
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -147,6 +148,24 @@ def encode_bulk(texts, batch_size=DEFAULT_BATCH_SIZE, attempts=ATTEMPTS):
     )
 
 
+# Progress bars and HF download chatter, which otherwise fill the crash report
+# and push the actual cause out of it. A segfault leaves no traceback at all, so
+# what is left in stderr is usually pure noise — say so rather than quoting it.
+_NOISE = re.compile(r"(\d+%\||it/s\]|Loading weights|HF Hub|huggingface|"
+                    r"^\s*$)", re.IGNORECASE)
+
+
+def _why(proc):
+    """The useful part of a dead child's output, or an honest 'nothing'."""
+    lines = [ln.strip()
+             for ln in (proc.stderr or "").splitlines() + (proc.stdout or "").splitlines()
+             if ln.strip() and not _NOISE.search(ln)]
+    if not lines:
+        return ("no diagnostic output — a native crash leaves no traceback, "
+                "which is consistent with the OpenMP fault")
+    return " | ".join(lines[-3:])
+
+
 def _run_child(texts, batch_size, env):
     """One child run. Returns (ok, vectors_or_None, detail)."""
     with tempfile.TemporaryDirectory(prefix="forensics_embed_") as tmp:
@@ -166,9 +185,7 @@ def _run_child(texts, batch_size, env):
         )
 
         if proc.returncode != 0 or not os.path.exists(out_path):
-            lines = (proc.stderr or proc.stdout or "").strip().splitlines()
-            tail = " | ".join(lines[-3:]) if lines else "no output"
-            return False, None, f"exit {proc.returncode}: {tail}"
+            return False, None, f"exit {proc.returncode}: {_why(proc)}"
 
         return True, np.load(out_path), ""
 
