@@ -1,13 +1,17 @@
-"""The bulk encode must stay out of the FAISS process, and fail catchably.
+"""The bulk encode must stay out of the FAISS process, and survive its crashes.
 
 The bug being guarded against is not a wrong answer, it is a native crash: four
 OpenMP runtimes co-loaded, a segfault inside torch's GELU during a background
 index build, and the whole Gradio server going down with it. A segfault cannot
 be caught by `except Exception`, so the only defence is that the crash happens
-somewhere other than the server process — measured, encoding 2,000 real
-artifact texts in the faiss-loaded process died 3 times out of 3.
+somewhere other than the server process.
+
+Crash probability rises with how much work one process does — 2,000 texts died
+1 run in 3, 60,414 died 5 out of 5 even single-threaded — so the encode is
+chunked and resumable, and these tests pin that contract.
 """
 
+import os
 import subprocess
 import sys
 
@@ -40,71 +44,120 @@ def test_child_script_does_not_import_faiss():
 
 
 class _Child:
-    """Stand-in for subprocess.run with a scripted outcome per call."""
+    """Stands in for a child process, writing chunks until it 'dies'.
 
-    def __init__(self, outcomes):
-        self.outcomes = list(outcomes)
+    `deaths` is how many chunks each spawn completes before failing; None means
+    the spawn finishes everything it was asked for.
+    """
+
+    def __init__(self, deaths, dim=4):
+        self.deaths = list(deaths)
+        self.dim = dim
         self.calls = []
 
     def __call__(self, cmd, **kwargs):
-        self.calls.append(kwargs.get("env") or {})
-        rc = self.outcomes.pop(0)
-        if rc == 0:
-            # Success means the child wrote the .npy the parent then loads.
-            out_path = cmd[3]
-            np.save(out_path, np.zeros((2, 4), dtype="float32"))
-        return type("P", (), {"returncode": rc, "stdout": "",
-                              "stderr": "Segmentation fault"})()
+        in_path, out_dir, start = cmd[2], cmd[3], int(cmd[4])
+        self.calls.append({"start": start, "env": kwargs.get("env") or {}})
+
+        import json
+        payload = json.load(open(in_path, encoding="utf-8"))
+        texts = payload["texts"]
+        chunk = payload["chunk_size"]
+        n_chunks = (len(texts) + chunk - 1) // chunk
+
+        budget = self.deaths.pop(0) if self.deaths else None
+        written = 0
+        for i in range(start, n_chunks):
+            if budget is not None and written >= budget:
+                return type("P", (), {"returncode": -1073741819, "stdout": "",
+                                      "stderr": ""})()
+            part = texts[i * chunk:(i + 1) * chunk]
+            np.save(os.path.join(out_dir, f"chunk_{i}.npy"),
+                    np.full((len(part), self.dim), float(i), dtype="float32"))
+            written += 1
+        return type("P", (), {"returncode": 0, "stdout": "", "stderr": ""})()
 
 
-def test_encode_bulk_reports_total_failure_as_an_exception(monkeypatch):
-    """A child that always dies must raise, not crash the parent."""
-    # 0xC0000005 is an access violation on Windows.
-    monkeypatch.setattr(embedding.subprocess, "run",
-                        _Child([-1073741819] * 3))
+def test_chunks_are_concatenated_in_order(monkeypatch):
+    """Order matters: row i of the result must be the vector for text i."""
+    monkeypatch.setattr(embedding.subprocess, "run", _Child([]))
+
+    out = embedding.encode_bulk([f"t{i}" for i in range(10)], chunk_size=4)
+
+    assert out.shape == (10, 4)
+    # _Child stamps each chunk with its index, so ordering is visible.
+    assert [row[0] for row in out] == [0, 0, 0, 0, 1, 1, 1, 1, 2, 2]
+
+
+def test_a_crashed_child_resumes_instead_of_restarting(monkeypatch):
+    """A dead child must cost only its own chunk, not the whole job."""
+    # First spawn completes 2 chunks then dies; second finishes the rest.
+    child = _Child([2])
+    monkeypatch.setattr(embedding.subprocess, "run", child)
+
+    out = embedding.encode_bulk([f"t{i}" for i in range(10)], chunk_size=2)
+
+    assert out.shape == (10, 4)
+    assert len(child.calls) == 2
+    assert child.calls[0]["start"] == 0
+    assert child.calls[1]["start"] == 2, (
+        f"restarted from {child.calls[1]['start']} instead of resuming at 2")
+
+
+def test_progress_resets_the_stall_counter(monkeypatch):
+    """Many crashes are fine as long as each one made progress first.
+
+    Under a fixed retry budget a 60-chunk job could never finish; the give-up
+    rule has to count stalls, not attempts.
+    """
+    # Ten spawns, each completing exactly one chunk before dying.
+    child = _Child([1] * 10)
+    monkeypatch.setattr(embedding.subprocess, "run", child)
+
+    out = embedding.encode_bulk([f"t{i}" for i in range(10)],
+                                chunk_size=1, max_stalls=2)
+
+    assert out.shape == (10, 4)
+    assert len(child.calls) > 2, "gave up despite steady progress"
+
+
+def test_repeated_no_progress_raises(monkeypatch):
+    """A chunk nothing can encode must fail loudly, not spin forever."""
+    child = _Child([0] * 20)  # every spawn dies before writing anything
+    monkeypatch.setattr(embedding.subprocess, "run", child)
 
     with pytest.raises(RuntimeError) as exc:
-        embedding.encode_bulk(["one", "two"], attempts=3)
+        embedding.encode_bulk([f"t{i}" for i in range(10)],
+                              chunk_size=2, max_stalls=3)
 
-    # The examiner has to be able to tell what died and how.
-    assert "1073741819" in str(exc.value)
-    assert "2 texts" in str(exc.value)
+    assert len(child.calls) == 3, "stall budget not honoured"
+    assert "stalled at chunk 0" in str(exc.value)
+    assert "10 texts" in str(exc.value)
 
 
-def test_a_crashed_child_is_retried(monkeypatch):
-    """The crash is intermittent, so a fresh process usually succeeds."""
-    child = _Child([-1073741819, 0])
+def test_last_stall_serialises_openmp(monkeypatch):
+    """Before giving up, try the one setting known to lower the risk."""
+    child = _Child([0] * 20)
     monkeypatch.setattr(embedding.subprocess, "run", child)
 
-    out = embedding.encode_bulk(["one", "two"], attempts=3)
-    assert out.shape == (2, 4)
-    assert len(child.calls) == 2, "did not retry after a crash"
+    with pytest.raises(RuntimeError):
+        embedding.encode_bulk(["a", "b"], chunk_size=1, max_stalls=3)
 
-
-def test_last_attempt_serialises_openmp(monkeypatch):
-    """Final retry drops to OMP_NUM_THREADS=1, which removes the race."""
-    child = _Child([-1073741819, -1073741819, 0])
-    monkeypatch.setattr(embedding.subprocess, "run", child)
-
-    embedding.encode_bulk(["one", "two"], attempts=3)
-
-    assert len(child.calls) == 3
-    assert child.calls[0].get("OMP_NUM_THREADS") != "1"
-    assert child.calls[1].get("OMP_NUM_THREADS") != "1"
-    assert child.calls[2].get("OMP_NUM_THREADS") == "1", (
-        "last attempt did not serialise OpenMP")
+    assert child.calls[0]["env"].get("OMP_NUM_THREADS") != "1"
+    assert child.calls[-1]["env"].get("OMP_NUM_THREADS") == "1", (
+        "never tried serialised OpenMP before giving up")
 
 
 def test_encode_bulk_never_falls_back_to_the_parent(monkeypatch):
     """Running a known-crashy workload in the server is what this prevents."""
-    monkeypatch.setattr(embedding.subprocess, "run", _Child([1, 1, 1]))
+    monkeypatch.setattr(embedding.subprocess, "run", _Child([0] * 20))
 
     called = []
     monkeypatch.setattr(embedding, "encode_in_process",
                         lambda *a, **k: called.append(1))
 
     with pytest.raises(RuntimeError):
-        embedding.encode_bulk(["one"], attempts=3)
+        embedding.encode_bulk(["one"], chunk_size=1, max_stalls=2)
     assert not called, "fell back to encoding in the parent process"
 
 
@@ -130,3 +183,62 @@ def test_in_process_escape_hatch_skips_the_subprocess(monkeypatch):
                                                                 dtype="float32"))
     out = embedding.encode_bulk(["a", "b", "c"])
     assert out.shape == (3, 4)
+
+
+def test_work_dir_chunks_survive_a_failed_build(tmp_path, monkeypatch):
+    """A build that gives up must leave its finished chunks behind.
+
+    The first full-scale run stalled at chunk 55 of 121 and the temp directory
+    took an hour of encoding with it.
+    """
+    work = tmp_path / "embed_chunks"
+    # Completes 2 chunks per spawn, then dies; stall budget runs out only after
+    # it stops progressing, so some chunks land before the failure.
+    child = _Child([2, 0, 0])
+    monkeypatch.setattr(embedding.subprocess, "run", child)
+
+    with pytest.raises(RuntimeError) as exc:
+        embedding.encode_bulk([f"t{i}" for i in range(10)], chunk_size=1,
+                              max_stalls=2, work_dir=str(work))
+
+    kept = sorted(p.name for p in work.glob("chunk_*.npy"))
+    assert kept == ["chunk_0.npy", "chunk_1.npy"], kept
+    assert "2/10 chunks are encoded and kept" in str(exc.value)
+
+
+def test_a_resumed_build_reuses_finished_chunks(tmp_path, monkeypatch):
+    work = tmp_path / "embed_chunks"
+    texts = [f"t{i}" for i in range(10)]
+
+    monkeypatch.setattr(embedding.subprocess, "run", _Child([3, 0, 0]))
+    with pytest.raises(RuntimeError):
+        embedding.encode_bulk(texts, chunk_size=1, max_stalls=2,
+                              work_dir=str(work))
+
+    resumed = _Child([])          # this one finishes everything it is given
+    monkeypatch.setattr(embedding.subprocess, "run", resumed)
+    out = embedding.encode_bulk(texts, chunk_size=1, max_stalls=2,
+                                work_dir=str(work))
+
+    assert out.shape == (10, 4)
+    assert resumed.calls[0]["start"] == 3, (
+        f"restarted at {resumed.calls[0]['start']} instead of resuming at 3")
+
+
+def test_changed_texts_discard_stale_chunks(tmp_path, monkeypatch):
+    """Chunk N of an old run is not chunk N of a new one. Silence here would
+    corrupt the index rather than fail it."""
+    work = tmp_path / "embed_chunks"
+
+    monkeypatch.setattr(embedding.subprocess, "run", _Child([]))
+    embedding.encode_bulk([f"t{i}" for i in range(10)], chunk_size=5,
+                          work_dir=str(work))
+    assert len(list(work.glob("chunk_*.npy"))) == 2
+
+    # A different text set of the same length must not reuse those chunks.
+    child = _Child([])
+    monkeypatch.setattr(embedding.subprocess, "run", child)
+    out = embedding.encode_bulk([f"CHANGED{i}" for i in range(10)],
+                                chunk_size=5, work_dir=str(work))
+    assert out.shape == (10, 4)
+    assert child.calls[0]["start"] == 0, "reused chunks from a different text set"

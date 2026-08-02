@@ -26,13 +26,15 @@ NIST re-validated 11/11 through a full carve. Nothing is half-finished.
 
 **Next, in the order I'd do it:**
 
-1. **Promote the verified carve into the cache** (item 2 below). The carve is
-   now ~107s, so the cost is just the ~50 min re-embed — and the re-embed is
-   worth doing *now* as the first real exercise of the subprocess encoder at
-   full scale (62k texts vs the 2k tested). Watch for how often it retries.
-2. **Get faiss/torch/sklearn onto one OpenMP runtime** (item 3 below). The
-   subprocess fix contains the segfault but does not remove it; this is the only
-   thing that actually removes it, and it is an environment change, not code.
+1. **Get faiss/torch/sklearn onto one OpenMP runtime** (item 3 below). The
+   chunked subprocess encoder makes the index buildable and keeps the server
+   alive, but it is working *around* a crash that still happens on most chunks.
+   This is the only thing that actually removes it — and it is an environment
+   change (matching wheels / conda-forge), not code.
+2. **Tune `FORENSICS_EMBED_CHUNK`** if index builds feel slow. 1,000 was chosen
+   because 2,000 crashed 1 run in 3 and 400 never crashed; it has not been swept
+   for the best throughput/robustness trade. Each crash costs one chunk plus a
+   model load, so bigger chunks are only better while they mostly survive.
 3. **Parallelise EVTX with a process pool** (item 1 below). It is 83% of a carve
    and it is the only thing left that is slow. Optional: a 107s carve is not a
    problem anyone is complaining about.
@@ -533,12 +535,84 @@ match on "omp" catches `_dec`**`omp`**`_*.pyd` and
 
 **Fixed in `f89313e`:** bulk encoding moved into a child process
 (`src/forensics/embedding.py`). This **contains** the crash rather than
-preventing it — the child still crashes sometimes, but it exits with a status
-the parent catches instead of killing the Gradio server. Four fast retries
-usually get through; the fifth sets `OMP_NUM_THREADS=1`, removing the race at
-~10x encode cost. It never falls back to encoding in the parent. Verified
-bit-identical to in-process encoding (max abs diff 0.0, min cosine 1.0 over 400
-real texts), so retrieval is unchanged.
+preventing it — the child still crashes, but it exits with a status the parent
+catches instead of killing the Gradio server. It never falls back to encoding in
+the parent. Verified bit-identical to in-process encoding (max abs diff 0.0, min
+cosine 1.0 over 400 real texts), so retrieval is unchanged.
+
+**Then the first full-scale run showed retrying the whole job is useless.**
+Crash probability scales with how much work one process does:
+
+| texts in one encode call | result |
+|---|---|
+| 400 | never observed crashing |
+| 2,000 | crashed 1 run in 3 (`OMP_NUM_THREADS=1`: 2/2 OK) |
+| 60,414 (the real embed set) | **crashed 5 runs out of 5, including with `OMP_NUM_THREADS=1`** |
+
+So `OMP_NUM_THREADS=1`, recorded here as "known to work", **works at 2k and not
+at 60k**. Any fix that reruns the whole encode is dead on arrival at real scale.
+
+**So the encoder is chunked and resumable.** Each chunk (default 500, via
+`FORENSICS_EMBED_CHUNK`) is written out before the next starts, a dying child
+costs only the chunk in flight, and its replacement resumes there. The give-up
+rule counts **stalls, not attempts** — consecutive children that complete zero
+chunks — because under a fixed retry budget a 60-chunk job could never finish.
+The child walks the remaining chunks itself so the model is loaded once per
+crash rather than once per chunk. Chunk files are written to a temp name and
+renamed, so a crash mid-write cannot leave a truncated file that reads as done.
+
+**Chunk size is not about the crash rate, it is about finishing before the
+crash.** The first chunked build still failed, stalling at chunk 0 five times:
+with 1,000-text chunks the child died *before completing one*, so resumption had
+nothing to resume from. What matters is that a chunk lands.
+
+**Finished chunks are kept in the case directory, not a temp dir.** The first
+run that got this far stalled at chunk 55 of 121 — and `TemporaryDirectory`
+deleted an hour of encoding on the way out. `encode_bulk(work_dir=...)` now
+writes chunks to `src/cache/<sha256>/embed_chunks/`, so a build that gives up
+can simply be re-run and picks up where it stopped. The directory carries a
+fingerprint of the text set and chunk size; if either changes the old chunks are
+discarded, because chunk 12 of a different text set is not chunk 12 of this one
+and reusing it would corrupt the index silently rather than fail.
+
+**It is probably memory, not OpenMP alone.** The same child on the same payload
+behaves very differently depending on what the *parent* has loaded:
+
+| parent holds | child outcome (chunk=1000) |
+|---|---|
+| nothing | 2 chunks+, survived past 100s (3 runs; 1 crash after 1 chunk) |
+| the 80k-row DataFrame | same — 1 crash after 1 chunk, 1 survived |
+| **`import faiss`** | **0 chunks, crashed in ~30s, 5 runs out of 5** |
+
+These are separate processes, so this looked inexplicable at first. It is not
+the inherited environment (`import faiss` changes nothing in `os.environ` —
+checked) and not the CPU affinity mask (`0xff` before and after — checked).
+
+Then a test run launched *while a build was already running* failed with
+`OpenBLAS error: Memory allocation still failed after 10 retries, giving up.`
+— an explicit allocation failure, not a segfault. That is the first direct
+evidence of what is actually going on: **this box has 16 GB, an encode child
+wants ~2 GB, and every extra thing the parent holds (faiss, the DataFrame,
+another encode process) eats the headroom.** It fits everything: crash
+probability rising with texts per process, the `import faiss` parent being
+worst, and my own concurrent measurements making things worse.
+
+Treat that as the leading hypothesis rather than a settled cause — the failures
+are usually 0xC0000005 rather than a clean allocation error. But it means
+**don't run anything heavy while an index build is going**, and it makes the
+chunking fix look right for the right reason: smaller chunks need less resident
+memory, not just less time.
+
+`rag.py` now also imports faiss **lazily**, after `encode_bulk` returns, so a
+fresh index build encodes before faiss is loaded in that process. Once loaded it
+stays, so this helps the first build in a process — the expensive one.
+
+**Two broken probes this session, same root cause.** Both the OpenMP enumeration
+and the CPU-affinity check returned confident, clean-looking answers — "zero
+runtimes loaded", "affinity 0x0" — because `ctypes` truncates the 64-bit
+`HANDLE` from `GetCurrentProcess` without explicit `restype`/`argtypes`. A
+zeroed affinity mask is impossible and should have been obviously wrong. Always
+sanity-check a Win32 probe against a value you already know.
 
 **Still open, deliberately:** query embedding stays in-process (one short string,
 never observed crashing; a subprocess per query would add a model load to every
@@ -595,6 +669,12 @@ have no hive. Only `Jimmy Wilson` does. Don't chase this.
   The extractor phase sat in this document at ~1,070s while it was really 67s;
   the same commit that fixed the walk had sped the extractors up too. A whole
   decision (`CARVE_MAX_WORKERS`) was made twice against that stale number.
+- **Don't run anything heavy while an index build is going.** Encode children
+  want ~2 GB each on a 16 GB box, and a second Python process tipped one build
+  from steady progress into its stall limit — my own measurement run caused the
+  only stall-out this design has had. It also invalidates whatever you were
+  measuring: an `OpenBLAS` allocation failure is what finally revealed the
+  memory angle, but everything timed under that load was noise.
 - **Don't edit `embedding.py` while an index build is running.** The child
   re-executes that file from disk on *every* spawn, so an edit lands mid-run and
   changes the behaviour of an operation already in flight. A missing `import re`

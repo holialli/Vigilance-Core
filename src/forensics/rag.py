@@ -4,11 +4,20 @@ import os
 import re
 import time
 
-import faiss
 import numpy as np
 
 from .config import CACHE_DIR
 from .embedding import encode_bulk, encode_query
+
+# faiss is imported lazily, inside the functions that need it, rather than at
+# module scope. Measured: an encode child spawned from a parent that has already
+# imported faiss died before finishing a single chunk in 5 runs out of 5, while
+# the same child from a parent without it got through 2 chunks or more in 3 runs
+# out of 5. The mechanism is not understood — the two are separate processes,
+# and neither the inherited environment nor the CPU affinity mask differs — so
+# treat this as an observed association, not a theory. Deferring the import is
+# free, and it means a *fresh* index build does its encoding before faiss is
+# ever loaded here. Once faiss is in, it stays for the life of the process.
 
 # Bulk types are embedded into FAISS. FILESYSTEM is excluded: its MFT dump is far
 # too large and repetitive to embed usefully, and file-count questions are served
@@ -102,6 +111,7 @@ def build_rag_context(query, session, top_k=8):
             # ── REQ-4: Validate cache against filtered embed_df, not full df ─
             if cache_file and os.path.exists(cache_file):
                 print(f"  [FAISS] Loading cached index: {session.image_hash_sha256[:16]}...")
+                import faiss
                 loaded_index = faiss.read_index(cache_file)
                 if loaded_index.ntotal == len(embed_df):
                     session.faiss_index = loaded_index
@@ -126,17 +136,27 @@ def build_rag_context(query, session, top_k=8):
                 # Normalize to collapse volatile tokens and improve cache hits
                 normalized_texts = [_normalize_for_embedding(t) for t in unique_texts]
 
-                # Encoded in a child process that never imports faiss: three
-                # OpenMP runtimes in one process crash this call nondeterminist-
-                # ically, and a segfault here would take the Gradio server down
-                # with it rather than failing this one build. See embedding.py.
-                unique_embeddings = encode_bulk(normalized_texts, batch_size=256)
+                # Encoded in child processes: four OpenMP runtimes in one
+                # process crash this call, and a segfault here would take the
+                # Gradio server down rather than failing this one build. Note
+                # this runs *before* faiss is imported below, deliberately.
+                # See embedding.py.
+                #
+                # Finished chunks go in the case directory, not a temp dir, so a
+                # build that gives up can be resumed rather than repeated. On
+                # this image that is over an hour of encoding worth keeping.
+                chunk_dir = (os.path.join(CACHE_DIR, session.image_hash_sha256,
+                                          "embed_chunks")
+                             if session.image_hash_sha256 else None)
+                unique_embeddings = encode_bulk(normalized_texts, batch_size=256,
+                                                work_dir=chunk_dir)
 
                 # Map unique embeddings back to the full filtered series
                 text_to_idx = {text: i for i, text in enumerate(unique_texts)}
                 idx_map = texts_series.map(text_to_idx).values
                 full_embeddings = unique_embeddings[idx_map]
 
+                import faiss
                 dim = full_embeddings.shape[1]
 
                 # ── FIX-2: IVF only at large scale; Flat L2 for typical loads ─
