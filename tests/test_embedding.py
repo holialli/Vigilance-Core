@@ -57,7 +57,8 @@ class _Child:
 
     def __call__(self, cmd, **kwargs):
         in_path, out_dir, start = cmd[2], cmd[3], int(cmd[4])
-        self.calls.append({"start": start, "env": kwargs.get("env") or {}})
+        self.calls.append({"start": start, "env": kwargs.get("env") or {},
+                           "batch": int(cmd[5])})
 
         import json
         payload = json.load(open(in_path, encoding="utf-8"))
@@ -133,6 +134,49 @@ def test_repeated_no_progress_raises(monkeypatch):
     assert len(child.calls) == 3, "stall budget not honoured"
     assert "stalled at chunk 0" in str(exc.value)
     assert "10 texts" in str(exc.value)
+
+
+def test_a_stalled_chunk_is_retried_with_a_smaller_batch(monkeypatch):
+    """Batch size is what sets the child's peak memory, so it is what a retry
+    has to change. Measured on 500 real texts: batch 256 peaks at 2,871 MB and
+    batch 32 at 1,228 MB, against ~2,500 MB of free commit on a box with no page
+    file. Retrying a failed chunk at the same batch just fails the same way."""
+    child = _Child([0] * 20)
+    monkeypatch.setattr(embedding.subprocess, "run", child)
+
+    with pytest.raises(RuntimeError):
+        embedding.encode_bulk(["a", "b"], chunk_size=1, batch_size=64,
+                              max_stalls=4)
+
+    tried = [c["batch"] for c in child.calls]
+    assert tried == [64, 32, 16, 8], tried
+
+
+def test_the_batch_ladder_has_a_floor(monkeypatch):
+    """Below a handful of texts per pass the memory is all model weights, and
+    shrinking further only costs throughput."""
+    child = _Child([0] * 20)
+    monkeypatch.setattr(embedding.subprocess, "run", child)
+
+    with pytest.raises(RuntimeError):
+        embedding.encode_bulk(["a"], chunk_size=1, batch_size=8, max_stalls=4)
+
+    assert min(c["batch"] for c in child.calls) == embedding.MIN_BATCH_SIZE
+
+
+def test_a_recovered_chunk_goes_back_to_full_speed(monkeypatch):
+    """The ladder is per-stall, not sticky: one bad chunk must not leave the
+    rest of a 121-chunk build crawling at the floor batch."""
+    # Stall once, then the next spawn completes a chunk and dies, and so on.
+    child = _Child([0, 1, 1])
+    monkeypatch.setattr(embedding.subprocess, "run", child)
+
+    embedding.encode_bulk([f"t{i}" for i in range(3)], chunk_size=1,
+                          batch_size=64, max_stalls=3)
+
+    tried = [c["batch"] for c in child.calls]
+    assert tried[0] == 64 and tried[1] == 32, tried
+    assert tried[2] == 64, f"stayed at a reduced batch after recovering: {tried}"
 
 
 def test_last_stall_serialises_openmp(monkeypatch):

@@ -148,7 +148,11 @@ def build_rag_context(query, session, top_k=8):
                 chunk_dir = (os.path.join(CACHE_DIR, session.image_hash_sha256,
                                           "embed_chunks")
                              if session.image_hash_sha256 else None)
-                unique_embeddings = encode_bulk(normalized_texts, batch_size=256,
+                # No batch_size here: embedding.py owns that number, and it is
+                # the one that decides whether the child fits in memory. This
+                # call used to pin it to 256, which overrode the default and
+                # put every child 400 MB over what this box can commit.
+                unique_embeddings = encode_bulk(normalized_texts,
                                                 work_dir=chunk_dir)
 
                 # Map unique embeddings back to the full filtered series

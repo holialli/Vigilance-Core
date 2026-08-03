@@ -66,7 +66,30 @@ import threading
 import numpy as np
 
 MODEL_NAME = "all-MiniLM-L6-v2"
-DEFAULT_BATCH_SIZE = 256
+
+# Texts per forward pass. This, not chunk size, is what sets the child's peak
+# memory: the loaded model sits at ~1,040 MB and every text in a batch adds
+# transient activations on top of it. Measured on the same 500 real artifact
+# texts, three interleaved rounds, one child process per row:
+#
+#     batch   peak commit   encode time
+#       256      2,871 MB         15.4s
+#        64      1,490 MB          6.7s
+#        32      1,228 MB          5.5s
+#         8      1,041 MB          4.7s
+#
+# This box has **no page file**, so the system commit limit is physical RAM
+# (15.9 GB) and free commit while the app is loaded is ~2.5 GB. At 256 the child
+# asks for more than the machine can commit and dies with 0xC0000005 — an
+# allocation failure surfacing as a NULL dereference in native code that does not
+# check malloc. 256 is also the *slowest* setting, because it thrashes on the way
+# there. 32 uses less than half the memory and encodes 2.8x faster.
+#
+# Check `GlobalMemoryStatusEx().ullAvailPageFile` before blaming OpenMP for a
+# crash here: if ullTotalPageFile == ullTotalPhys there is no page file, and the
+# headroom is far smaller than "16 GB of RAM" suggests.
+MIN_BATCH_SIZE = 8
+DEFAULT_BATCH_SIZE = int(os.getenv("FORENSICS_EMBED_BATCH", "32"))
 
 _model = None
 _model_lock = threading.Lock()
@@ -205,14 +228,21 @@ def _encode_into(texts, batch_size, chunk_size, n_chunks, max_stalls, work):
             break
         start, before = todo[0], n_chunks - len(todo)
 
-        # Only once the fast path has stalled repeatedly is it worth paying
-        # for serialised OpenMP — and note that is not a guaranteed fix at
-        # scale, merely lower-risk for one chunk.
+        # Halve the batch on every stall. What kills a child is an allocation
+        # the machine cannot commit, and batch size is the dial that allocation
+        # is on — so retrying the same batch just fails the same way, while a
+        # smaller one may fit in whatever headroom is left. It costs throughput
+        # only on chunks that have already failed.
+        attempt_batch = max(MIN_BATCH_SIZE, batch_size >> stalls)
+
+        # Only once that ladder has run out is it worth paying for serialised
+        # OpenMP — fewer threads means fewer per-thread workspaces, so it pulls
+        # the same lever less efficiently, at roughly half the speed.
         env = dict(os.environ)
         if stalls >= max_stalls - 1:
             env["OMP_NUM_THREADS"] = "1"
 
-        ok, detail = _run_child(in_path, work, start, env)
+        ok, detail = _run_child(in_path, work, start, env, attempt_batch)
         gained = (n_chunks - len(remaining())) - before
 
         if ok and not remaining():
@@ -225,9 +255,9 @@ def _encode_into(texts, batch_size, chunk_size, n_chunks, max_stalls, work):
                   f"/{n_chunks}.")
         else:
             stalls += 1
-            failures.append(f"chunk {start}: {detail}")
+            failures.append(f"chunk {start} at batch {attempt_batch}: {detail}")
             print(f"  [EMBED] Encode child made no progress at chunk "
-                  f"{start}/{n_chunks} ({detail}); "
+                  f"{start}/{n_chunks} at batch {attempt_batch} ({detail}); "
                   f"stall {stalls}/{max_stalls}.")
 
         if stalls >= max_stalls:
@@ -273,14 +303,14 @@ def _why(proc):
     return " | ".join(lines[-3:])
 
 
-def _run_child(in_path, out_dir, start_chunk, env):
+def _run_child(in_path, out_dir, start_chunk, env, batch_size):
     """One child run, encoding from start_chunk on. Returns (ok, detail)."""
     # Run this file as a plain script, not as `-m forensics.embedding`: the
     # child then needs nothing on sys.path and imports no package __init__,
     # which is what keeps faiss out of it.
     proc = subprocess.run(
         [sys.executable, os.path.abspath(__file__), in_path, out_dir,
-         str(start_chunk)],
+         str(start_chunk), str(batch_size)],
         capture_output=True, text=True, env=env,
     )
     if proc.returncode != 0:
@@ -304,7 +334,10 @@ def _main(argv):
 
     texts = payload["texts"]
     chunk_size = payload.get("chunk_size", CHUNK_SIZE)
-    batch_size = payload.get("batch_size", DEFAULT_BATCH_SIZE)
+    # The parent lowers the batch on each stall, so its argument wins over the
+    # one recorded in the payload.
+    batch_size = (int(argv[4]) if len(argv) > 4
+                  else payload.get("batch_size", DEFAULT_BATCH_SIZE))
     n_chunks = (len(texts) + chunk_size - 1) // chunk_size
 
     from sentence_transformers import SentenceTransformer
