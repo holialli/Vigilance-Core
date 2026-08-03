@@ -205,6 +205,74 @@ def test_encode_bulk_never_falls_back_to_the_parent(monkeypatch):
     assert not called, "fell back to encoding in the parent process"
 
 
+def test_the_model_loads_from_cache_before_reaching_for_the_network(monkeypatch):
+    """A build spawns many children and each one re-resolved the model over the
+    network. One run lost two of five stall slots to an httpx error doing it."""
+    seen = []
+
+    class _ST:
+        def __init__(self, name, local_files_only=False):
+            seen.append(local_files_only)
+
+    monkeypatch.setitem(sys.modules, "sentence_transformers",
+                        type(sys)("sentence_transformers"))
+    sys.modules["sentence_transformers"].SentenceTransformer = _ST
+
+    embedding._new_model("all-MiniLM-L6-v2")
+    assert seen == [True], f"went to the network first: {seen}"
+
+
+def test_an_uncached_model_still_downloads(monkeypatch):
+    """The offline preference must not break a fresh checkout."""
+    seen = []
+
+    class _ST:
+        def __init__(self, name, local_files_only=False):
+            seen.append(local_files_only)
+            if local_files_only:
+                raise OSError("model not found in local cache")
+
+    monkeypatch.setitem(sys.modules, "sentence_transformers",
+                        type(sys)("sentence_transformers"))
+    sys.modules["sentence_transformers"].SentenceTransformer = _ST
+
+    embedding._new_model("all-MiniLM-L6-v2")
+    assert seen == [True, False], f"never fell back to a download: {seen}"
+
+
+def test_query_falls_back_to_a_child_when_memory_runs_out(monkeypatch):
+    """The first question after an index build is the worst moment to ask for
+    1 GB, and that is exactly when the model loads. A machine that cannot commit
+    it must still answer, slowly, rather than put a stack trace where the
+    evidence goes."""
+    def _oom(*a, **k):
+        # Rendered the way safetensors' Rust error reaches Python: no .winerror,
+        # only the string. Matching on the code alone would miss this.
+        raise OSError("The paging file is too small for this operation to "
+                      "complete. (os error 1455)")
+
+    monkeypatch.setattr(embedding, "encode_in_process", _oom)
+    monkeypatch.setattr(embedding.subprocess, "run", _Child([]))
+
+    out = embedding.encode_query("what USB devices were connected")
+    assert out.shape[0] == 1
+
+
+def test_query_does_not_swallow_a_real_error(monkeypatch):
+    """Only memory exhaustion earns the slow path. Anything else is a bug and
+    must surface as itself."""
+    def _boom(*a, **k):
+        raise OSError("model.safetensors is corrupt")
+
+    monkeypatch.setattr(embedding, "encode_in_process", _boom)
+    monkeypatch.setattr(embedding.subprocess, "run",
+                        lambda *a, **k: pytest.fail("spawned a child for a "
+                                                    "non-memory failure"))
+
+    with pytest.raises(OSError, match="corrupt"):
+        embedding.encode_query("anything")
+
+
 def test_empty_input_needs_no_subprocess(monkeypatch):
     def _boom(*a, **k):
         raise AssertionError("spawned a process for nothing")

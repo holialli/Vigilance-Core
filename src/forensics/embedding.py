@@ -95,13 +95,36 @@ _model = None
 _model_lock = threading.Lock()
 
 
+def _new_model(name):
+    """Construct the model, preferring the copy already on disk.
+
+    Left to itself, every spawn re-resolves the model against the HF Hub over
+    the network — for a model that has not changed and is already cached. That
+    is a round-trip on each of a build's many child processes, a hard network
+    dependency for a tool meant to run on an offline forensic workstation, and
+    a failure mode of its own: one build here lost two of its five stall slots
+    to `RuntimeError: Cannot send a request, as the client has been closed`
+    from httpx inside huggingface_hub. That is not a crash, and no amount of
+    shrinking the batch would have helped it.
+
+    The fallback covers the first run on a fresh checkout, where there is
+    nothing cached yet and the download genuinely has to happen.
+    """
+    from sentence_transformers import SentenceTransformer
+    try:
+        return SentenceTransformer(name, local_files_only=True)
+    except Exception:
+        # Nothing cached — fetch it, and let that attempt's own error stand if
+        # it fails too, since "could not download" is the useful message then.
+        return SentenceTransformer(name)
+
+
 def _load_model():
     """Load the sentence transformer into *this* process, once."""
     global _model
     with _model_lock:
         if _model is None:
-            from sentence_transformers import SentenceTransformer
-            _model = SentenceTransformer(MODEL_NAME)
+            _model = _new_model(MODEL_NAME)
     return _model
 
 
@@ -116,9 +139,60 @@ def encode_in_process(texts, batch_size=DEFAULT_BATCH_SIZE):
     )
 
 
+# Windows ERROR_COMMITMENT_LIMIT: "The paging file is too small for this
+# operation to complete." The system commit limit was hit — on a box with no
+# page file that means physical RAM, whatever free RAM claims.
+_COMMITMENT_LIMIT = 1455
+
+# The message has to be matched as well as the code, because the error can reach
+# Python without one. The failure observed here came out of `safetensors`, whose
+# Rust std::io::Error is converted to a bare OSError carrying only a string:
+# the giveaway is that it renders as "(os error 1455)" where a Python-raised
+# WindowsError would render as "[WinError 1455]" and populate .winerror.
+_OOM_TEXT = re.compile(r"paging file is too small|os error 1455|"
+                       r"cannot allocate memory|out of memory", re.IGNORECASE)
+
+
+def _is_out_of_memory(exc):
+    """Is this exception the machine refusing to commit, rather than a bug?"""
+    if isinstance(exc, MemoryError):
+        return True
+    if not isinstance(exc, OSError):
+        return False
+    return (getattr(exc, "winerror", None) == _COMMITMENT_LIMIT
+            or bool(_OOM_TEXT.search(str(exc))))
+
+
 def encode_query(text):
-    """Embed a single query string, in-process. See the module docstring."""
-    return encode_in_process([text], batch_size=1)
+    """Embed a single query string, in-process, falling back to a child.
+
+    The in-process load is what makes queries fast: ~1,040 MB of model that is
+    then resident for every later question, which answers in ~0.3s instead of
+    paying a 20s model load each time.
+
+    But it is 1,040 MB asked for at the worst possible moment — the first
+    question after an index build, with the server holding a case DataFrame and
+    a 60k-vector index — on a machine whose commit limit is physical RAM. That
+    is not hypothetical: the run that first built this index got as far as
+    writing the index and then died on this exact call with
+    "The paging file is too small for this operation to complete."
+
+    So a memory failure here falls back to a child process, which gets its own
+    commit charge and leaves the server's untouched. Slow — a model load per
+    query — but a slow answer beats a stack trace where the evidence should be.
+    The failure is deliberately not cached: memory frees up, and the next query
+    should get the fast path back.
+    """
+    try:
+        return encode_in_process([text], batch_size=1)
+    except Exception as e:
+        if not _is_out_of_memory(e) or not _subprocess_enabled():
+            raise
+        print(f"  [EMBED] Not enough memory to load the model in-process ({e}); "
+              f"embedding this query in a child instead. Queries will stay slow "
+              f"until there is room. On Windows, check that a page file is "
+              f"enabled — without one the commit limit is physical RAM.")
+        return encode_bulk([text], batch_size=1)
 
 
 def _subprocess_enabled():
@@ -340,9 +414,7 @@ def _main(argv):
                   else payload.get("batch_size", DEFAULT_BATCH_SIZE))
     n_chunks = (len(texts) + chunk_size - 1) // chunk_size
 
-    from sentence_transformers import SentenceTransformer
-
-    model = SentenceTransformer(payload.get("model", MODEL_NAME))
+    model = _new_model(payload.get("model", MODEL_NAME))
 
     for i in range(start_chunk, n_chunks):
         out_path = os.path.join(out_dir, f"chunk_{i}.npy")
