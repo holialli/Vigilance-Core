@@ -636,6 +636,36 @@ commit the child then cannot have.
   slots to `RuntimeError: Cannot send a request, as the client has been closed`
   from httpx. Model load: 22.2s → 13.5s per process.
 
+**There is a floor, and batch size cannot get under it.** The model itself is
+~1,040 MB resident before a single text is encoded. When free commit is below
+that, *no* batch size works and the retry ladder is descending against something
+it does not control. The child says so plainly when it happens:
+
+    OSError: The paging file is too small for this operation to complete.
+             (os error 1455)      ← raised by safe_open(), i.e. at model load
+
+So an explicit out-of-memory now short-circuits the ladder once it reaches the
+floor batch, and raises a message naming the real cause and the real fix instead
+of reporting a stall count. Burning three more attempts to re-prove that 8 is
+still too big helps nobody.
+
+**How much the parent matters, measured on one afternoon:**
+
+| parent process | avail commit left for the child | result |
+|---|---:|---|
+| `build_rag_context` (80k DataFrame + pandas + texts) | **721 MB** | stalls at every batch |
+| same, after `del` of the frame | 1,037 MB | stalls — still under the 1,040 MB floor |
+| a process holding **only the text list** | **2,057 MB** | encodes normally |
+
+Which is why the working recipe on a constrained box is **two processes**:
+derive the text list, exit, then encode from a clean process into
+`embed_chunks/`. The chunk fingerprint covers `(texts, chunk_size)`, so a later
+real build finds every chunk done and only has to concatenate and index them —
+no model load at all. Scratch scripts `extract_texts.py` / `encode_only.py`.
+
+This is worth knowing but it is not a design to be proud of: it exists because
+the box has no page file. Fix that and the single-process build fits.
+
 **The built index is a mix of batch sizes, and that is fine — checked, not
 assumed.** Chunks 0–114 were encoded at batch 256 before the fix and 115–120 at
 32 after it. sentence-transformers sorts by length and pads each batch to its

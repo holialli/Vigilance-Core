@@ -31,7 +31,7 @@ present) if none of `GEMINI_API_KEY`, `GROQ_API_KEY`, or a reachable local Ollam
 default `http://localhost:11434`) is available. Copy `.env.example` to `src/.env` to configure.
 
 ```bash
-python -m pytest tests/ -q     # 146 tests
+python -m pytest tests/ -q     # 154 tests
 ```
 
 ## Installing dependencies
@@ -139,6 +139,12 @@ is physical RAM, and an encode child at the old `batch_size=256` peaked at 2,871
 sessions were spent attributing these to mixed OpenMP runtimes. Tuning knobs: `FORENSICS_EMBED_BATCH` (32,
 this is the one that sets peak memory), `FORENSICS_EMBED_CHUNK` (500, resumption granularity only),
 `FORENSICS_EMBED_IN_PROCESS=1` to disable subprocessing. Don't run anything heavy alongside a build.
+
+**There is a floor batch size cannot get under**: the model is ~1,040 MB before a single text is encoded.
+Below that much free commit, nothing works and the retry ladder is descending against something it does
+not control — so an explicit out-of-memory now stops early and says so. A parent holding an 80k-row case
+left only 721 MB; one holding just the text list left 2,057 MB. On a constrained box, encode from a
+separate lean process into `embed_chunks/` and let the real build pick the finished chunks up.
 
 Also: `.venv/Scripts/python.exe` is a redirector stub that spawns the real interpreter as a separate
 process, so `Popen.pid` is **not** the process doing the work. Per-process probes aimed at it measure ~1 MB.

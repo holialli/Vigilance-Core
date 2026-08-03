@@ -179,6 +179,53 @@ def test_a_recovered_chunk_goes_back_to_full_speed(monkeypatch):
     assert tried[2] == 64, f"stayed at a reduced batch after recovering: {tried}"
 
 
+class _OomChild(_Child):
+    """A child that dies the way a commit-exhausted one does: at model load."""
+
+    def __call__(self, cmd, **kwargs):
+        super().__call__(cmd, **kwargs)
+        return type("P", (), {
+            "returncode": 1, "stdout": "",
+            "stderr": 'with safe_open(checkpoint_file, framework="pt") as f:\n'
+                      'OSError: The paging file is too small for this '
+                      'operation to complete. (os error 1455)'})()
+
+
+def test_an_out_of_memory_gives_up_instead_of_shrinking_forever(monkeypatch):
+    """The batch ladder is the wrong answer to a failure at model *load*: the
+    weights are ~1,040 MB before a single text is encoded, and batch size does
+    not control that. Descending to the floor and burning the rest of the stall
+    budget only delays an honest answer."""
+    child = _OomChild([0] * 20)
+    monkeypatch.setattr(embedding.subprocess, "run", child)
+
+    with pytest.raises(RuntimeError) as exc:
+        embedding.encode_bulk(["a", "b"], chunk_size=1, batch_size=32,
+                              max_stalls=5)
+
+    msg = str(exc.value)
+    assert "Not enough memory" in msg
+    assert "smaller batch cannot help" in msg
+    assert "page file" in msg
+    # 32 -> 16 -> 8, then stop: the floor is reached and reaching it again
+    # proves nothing.
+    assert [c["batch"] for c in child.calls] == [32, 16, 8], \
+        [c["batch"] for c in child.calls]
+
+
+def test_a_non_memory_stall_still_uses_the_whole_budget(monkeypatch):
+    """Only an explicit out-of-memory shortcuts the retries."""
+    child = _Child([0] * 20)
+    monkeypatch.setattr(embedding.subprocess, "run", child)
+
+    with pytest.raises(RuntimeError) as exc:
+        embedding.encode_bulk(["a", "b"], chunk_size=1, batch_size=32,
+                              max_stalls=5)
+
+    assert "Not enough memory" not in str(exc.value)
+    assert len(child.calls) == 5
+
+
 def test_last_stall_serialises_openmp(monkeypatch):
     """Before giving up, try the one setting known to lower the risk."""
     child = _Child([0] * 20)

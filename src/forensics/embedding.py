@@ -334,13 +334,34 @@ def _encode_into(texts, batch_size, chunk_size, n_chunks, max_stalls, work):
                   f"{start}/{n_chunks} at batch {attempt_batch} ({detail}); "
                   f"stall {stalls}/{max_stalls}.")
 
+        # A batch is only worth shrinking if the child got far enough to run a
+        # forward pass. When the machine cannot even commit the model weights —
+        # ~1,040 MB before a single text is encoded — the ladder is descending
+        # against something batch size does not control, and the remaining
+        # attempts only delay an honest answer.
+        out_of_memory = bool(_OOM_TEXT.search(detail))
+        if out_of_memory and attempt_batch <= MIN_BATCH_SIZE:
+            stalls = max_stalls
+
         if stalls >= max_stalls:
             done = n_chunks - len(remaining())
+            kept = (f"{done}/{n_chunks} chunks are encoded and kept; "
+                    f"re-running resumes from there. ")
+            if out_of_memory or any(_OOM_TEXT.search(f) for f in failures):
+                raise RuntimeError(
+                    f"Not enough memory to embed: the encode process could not "
+                    f"be given the ~1,040 MB the model needs, at chunk {start} "
+                    f"of {n_chunks}. This is a memory limit, not a crash — a "
+                    f"smaller batch cannot help, because the failure is at "
+                    f"model load. Close other applications, or (on Windows) "
+                    f"enable a page file: without one the commit limit is "
+                    f"physical RAM, and free commit is far lower than free RAM "
+                    f"suggests. " + kept + " || ".join(failures[-2:])
+                )
             raise RuntimeError(
                 f"Embedding stalled at chunk {start} of {n_chunks} while "
                 f"encoding {len(texts)} texts — {max_stalls} consecutive child "
-                f"processes completed nothing. {done}/{n_chunks} chunks are "
-                f"encoded and kept; re-running resumes from there. "
+                f"processes completed nothing. " + kept
                 + " || ".join(failures[-3:])
             )
 
