@@ -582,6 +582,19 @@ commit the child then cannot have.
   slots to `RuntimeError: Cannot send a request, as the client has been closed`
   from httpx. Model load: 22.2s → 13.5s per process.
 
+**The built index is a mix of batch sizes, and that is fine — checked, not
+assumed.** Chunks 0–114 were encoded at batch 256 before the fix and 115–120 at
+32 after it. sentence-transformers sorts by length and pads each batch to its
+longest member, so batch composition really is an input to the forward pass and
+the two halves could have been incomparable. Re-encoding chunk 114 at 32 and
+diffing against the stored batch-256 vectors: **max abs diff 1.1e-07, min cosine
+0.9999998, and all 500 vectors nearest-neighbour to themselves.** Float32
+rounding, nothing more. No rebuild needed.
+
+(Getting a batch-256 reference to compare against had to come off disk — a
+script that tried to *encode* at 256 for the comparison died with 0xC0000005
+doing it, which is its own small confirmation.)
+
 **The real fix is one Windows setting: enable a page file.** Everything above is
 the code fitting into a commit limit that should not be this small. Left undone
 deliberately — admin rights, machine-wide effect, owner's call.
