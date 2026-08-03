@@ -1,12 +1,11 @@
 # Vigilance-Core — Progress & Handoff
 
-Working notes for continuing this project. Last updated after profiling the
-extractor phase, which closed the concurrency question — **the carve is serial by
-default now**, and a full carve of the NIST image is ~22s, not 87 minutes — and
-after moving FAISS index encoding into a child process so its segfault can no
-longer take the server down.
+Working notes for continuing this project. Last updated after finding out why
+the FAISS index build had never once completed: **the machine has no page file,
+and the encode batch size was asking for more memory than it could commit.**
+The index is now built (60,414 vectors) and retrieval is verified against it.
 
-Repo: `holialli/Vigilance-Core` (branch `main`). 129 tests passing (`python -m pytest tests/ -q`).
+Repo: `holialli/Vigilance-Core` (branch `main`). 142 tests passing (`python -m pytest tests/ -q`).
 
 **Goal:** conversational forensics — an investigator asks questions in natural language
 instead of manually hunting through artifacts. Not trying to match Autopsy's parser
@@ -19,27 +18,30 @@ coverage; competing on the AI/triage layer Autopsy doesn't have.
 
 ## Start here
 
-**State:** clean. `main` at `f89313e`, working tree clean, 129 tests passing,
+**State:** clean. `main` at `b12f998`, working tree clean, 142 tests passing,
 NIST re-validated 11/11 through a full carve. Nothing is half-finished.
 
-**In flight:** nothing. The last session ended on a committed, verified change.
+**In flight:** nothing. The IACIS case (`6c18f662…`) now has a complete
+`faiss.index` — 60,414 vectors — and three test queries return real evidence off
+it. That had been the outstanding blocker for three sessions.
 
 **Next, in the order I'd do it:**
 
-1. **Get faiss/torch/sklearn onto one OpenMP runtime** (item 3 below). The
-   chunked subprocess encoder makes the index buildable and keeps the server
-   alive, but it is working *around* a crash that still happens on most chunks.
-   This is the only thing that actually removes it — and it is an environment
-   change (matching wheels / conda-forge), not code.
-2. **Tune `FORENSICS_EMBED_CHUNK`** if index builds feel slow. 1,000 was chosen
-   because 2,000 crashed 1 run in 3 and 400 never crashed; it has not been swept
-   for the best throughput/robustness trade. Each crash costs one chunk plus a
-   model load, so bigger chunks are only better while they mostly survive.
-3. **Parallelise EVTX with a process pool** (item 1 below). It is 83% of a carve
-   and it is the only thing left that is slow. Optional: a 107s carve is not a
-   problem anyone is complaining about.
-4. **Retrain or retire the anomaly model** (item 5 below). Still fires on 30% of
-   artifacts; the biggest *quality* gap left, now that speed is handled.
+1. **Turn on a page file** (item 3 below). This is the one that matters and it
+   is a Windows setting, not code: System → About → Advanced system settings →
+   Performance → Advanced → Virtual memory. Right now `ullTotalPageFile ==
+   ullTotalPhys`, so the commit limit *is* RAM and the app runs with 400–2,600 MB
+   of headroom. Every workaround in `embedding.py` exists to fit inside that.
+   **Not done here deliberately** — it needs admin, affects the whole machine,
+   and is the owner's call.
+2. **Retrain or retire the anomaly model** (item 5 below). Still fires on 30% of
+   artifacts; the biggest *quality* gap left, now that the index builds.
+3. **Sweep `FORENSICS_EMBED_BATCH` upward** once a page file exists. 32 was
+   chosen to fit today's headroom; 64 was 1.2x faster in the sweep and 256 only
+   lost because it thrashed. This is pure throughput, worth little until (1).
+4. **Parallelise EVTX with a process pool** (item 1 below). 83% of a carve, and
+   the only thing left that is slow. Optional: nobody is complaining about 107s.
+   Note it will want memory too — see (1) before starting.
 
 **Method note that has now paid off three times:** when a rewrite changes a
 count — or when you believe it changes nothing — diff the actual sets rather
@@ -374,6 +376,20 @@ The pattern in all three: a number was quoted from a row count or a single
 observation without a second, independent check. Prefer distinct counts, and
 prefer an external reference image over self-assessment.
 
+A fourth, and the most expensive so far:
+
+- **"The index build crashes because four OpenMP runtimes are co-loaded"** —
+  wrong, and it survived three sessions because the evidence *did* fit: the
+  crash was a `0xC0000005` inside an OMP-parallel op, and `OMP_NUM_THREADS=1`
+  made it go away. All true, all explained equally well by the actual cause —
+  a machine with no page file and a child asking for 2.9 GB of a 2.5 GB budget.
+  The runtime enumeration was careful and correct; it just wasn't the question.
+  **A hypothesis that explains the evidence is not the same as the one that is
+  true, and the cheap discriminating test here — "how much memory does this
+  process actually ask for?" — was never run.** Three sessions of work went into
+  containing a symptom. When a fix keeps *nearly* working, suspect the diagnosis
+  rather than reaching for a bigger version of the same fix.
+
 ### 1. Concurrency — DECIDED: the carve is serial (`CARVE_MAX_WORKERS=1`)
 
 **Resolved.** The default is now `1`. Threading was measured against serial on
@@ -492,12 +508,97 @@ Note `artifacts.pkl.bak` in the same directory is a *different* older carve
 (71,900 rows — has BROWSER/COMMUNICATION but no FILESYSTEM/DELETED/EXECUTION).
 Neither backup is worth keeping once the promoted carve is confirmed good.
 
-### 3. Segfault during FAISS index build — FIXED (contained), see below
+### 3. The index build "segfault" — SOLVED. It was memory, and the box has no page file.
+
+**The index now builds.** 60,414 vectors, zero stalls, and retrieval verified
+against it. Three sessions attributed this to mixed OpenMP runtimes. That was
+wrong, and the correct answer is embarrassingly ordinary.
+
+**This machine has no page file.** `GlobalMemoryStatusEx` reports
+`ullTotalPageFile == ullTotalPhys` (16,242 MB both), `Win32_PageFileUsage`
+returns nothing, and `AutomaticManagedPagefile` is `False`. So the **system
+commit limit is physical RAM**. Measured while the app holds a case:
+
+| moment | avail commit | avail *physical* |
+|---|---:|---:|
+| idle, case loaded | 2,060 MB | 5,213 MB |
+| FAISS index loaded | 1,063 MB | 5,115 MB |
+| during an index build | **369 MB** | 3,702 MB |
+
+**That second column is why nobody found this.** Free RAM never drops below
+~3.7 GB, so every casual look at memory said "plenty free" while the number that
+actually governs allocation was down to 369 MB.
+
+**And the child was sized for a machine with room.** Peak memory per encode
+child is set by `batch_size` — texts per forward pass — not by chunk size, which
+only decides how long a process lives. Chunk size is what three sessions tuned.
+`batch_size` sat at **256**, pinned in `rag.py`, overriding the module default.
+Same 500 real artifact texts, three interleaved rounds, one child per row:
+
+| batch | peak commit | encode time |
+|---:|---:|---:|
+| 256 | **2,871 MB** | 15.4s |
+| 64 | 1,490 MB | 6.7s |
+| 32 | 1,228 MB | 5.5s |
+| 8 | 1,041 MB | 4.7s |
+
+A child asking for 2,871 MB on a box with ~2,500 MB of free commit does not get
+it. **256 was also the slowest setting** — it thrashes on the way to failing —
+so dropping to 32 made the encode 2.8x faster *and* halved its memory. The
+loaded model alone is ~1,040 MB of that floor.
+
+**Why it looked like a segfault.** An allocation Windows cannot commit returns
+NULL, and native code that does not check dereferences it: `0xC0000005`, no
+traceback, indistinguishable from the OpenMP fault this project went looking
+for. It is not always silent, though, and the loud version names itself:
+
+    OSError: The paging file is too small for this operation to complete.
+             (os error 1455)
+
+That is `ERROR_COMMITMENT_LIMIT`. **Treat any `0xC0000005` from an encode child
+as an allocation failure until proven otherwise** — check
+`GlobalMemoryStatusEx().ullAvailPageFile` before opening a debugger.
+
+**The natural experiment that settles it.** Chunk 115 of this build killed five
+consecutive children, including the serialised-OpenMP last resort. Minutes
+later, the *same* chunk encoded cleanly 12 times out of 12 across four batch
+sizes — from a parent process holding nothing. Same data, same child code, same
+machine, same hour. The variable was memory, and nothing else. That also
+explains the "`import faiss` in the parent makes children die 5/5" result
+recorded below without needing any mechanism: faiss in the parent is ~1 GB of
+commit the child then cannot have.
+
+**Fixed in `90ff10a` and `b12f998`:**
+- Default `batch_size` 256 → **32** (`FORENSICS_EMBED_BATCH`), and `rag.py` no
+  longer pins it.
+- A stalled chunk is retried at **half the batch**, down to a floor of 8, and
+  the ladder resets on progress. Retrying an allocation the machine cannot
+  satisfy with the identical allocation was never going to work.
+- `encode_query` falls back to a child process on a memory failure instead of
+  raising. It loads ~1,040 MB *into the server*, at the worst possible moment —
+  the first question after an index build. That is what died with error 1455.
+- The model loads with `local_files_only=True` first. Every child spawn had
+  been re-resolving it over the network; one build lost two of its five stall
+  slots to `RuntimeError: Cannot send a request, as the client has been closed`
+  from httpx. Model load: 22.2s → 13.5s per process.
+
+**The real fix is one Windows setting: enable a page file.** Everything above is
+the code fitting into a commit limit that should not be this small. Left undone
+deliberately — admin rights, machine-wide effect, owner's call.
+
+---
+
+Everything below is the original OpenMP investigation, kept because the runtime
+enumeration is accurate and the probe lessons are the reusable part. **Its
+conclusion is superseded**: four OpenMP runtimes really are co-loaded, but that
+is not what was crashing the encode.
+
 The citation harness segfaulted **3 times in a row** inside torch's BERT forward
 (`transformers/activations.py`) while encoding ~2.3k texts, always during index
-*build*. `OMP_NUM_THREADS=1` made it pass.
+*build*. `OMP_NUM_THREADS=1` made it pass — which fits memory too: fewer threads
+means fewer per-thread workspaces, so it pulls the same lever, less efficiently.
 
-**Cause: multiple OpenMP runtimes loaded into one process.** Re-enumerated with
+**Four OpenMP runtimes are loaded into one process.** Re-enumerated with
 `EnumProcessModules` at each import step. **There are four, not three** — the
 earlier count missed one of torch's:
 
@@ -552,6 +653,11 @@ Crash probability scales with how much work one process does:
 So `OMP_NUM_THREADS=1`, recorded here as "known to work", **works at 2k and not
 at 60k**. Any fix that reruns the whole encode is dead on arrival at real scale.
 
+> Read this table again knowing the cause is memory and it says something
+> simpler: more texts held at once, more memory, less headroom. It is a memory
+> curve, not a crash-probability curve. `OMP_NUM_THREADS=1` shifted it a little
+> because each OpenMP thread carries its own workspace — it was never a fix.
+
 **So the encoder is chunked and resumable.** Each chunk (default 500, via
 `FORENSICS_EMBED_CHUNK`) is written out before the next starts, a dying child
 costs only the chunk in flight, and its replacement resumes there. The give-up
@@ -566,6 +672,13 @@ crash.** The first chunked build still failed, stalling at chunk 0 five times:
 with 1,000-text chunks the child died *before completing one*, so resumption had
 nothing to resume from. What matters is that a chunk lands.
 
+> **Superseded.** Chunk size never had much to do with it. Peak memory is set by
+> `batch_size`, which is per *forward pass* and was 256 throughout all of this
+> tuning; chunk size only changes how many batches a process runs. Smaller
+> chunks helped by ending processes sooner, not by making any one of them fit.
+> Resumability is still worth having, so the chunking stays — but 500 is a
+> resumption granularity now, not a crash mitigation.
+
 **Finished chunks are kept in the case directory, not a temp dir.** The first
 run that got this far stalled at chunk 55 of 121 — and `TemporaryDirectory`
 deleted an hour of encoding on the way out. `encode_bulk(work_dir=...)` now
@@ -575,8 +688,10 @@ fingerprint of the text set and chunk size; if either changes the old chunks are
 discarded, because chunk 12 of a different text set is not chunk 12 of this one
 and reusing it would corrupt the index silently rather than fail.
 
-**It is probably memory, not OpenMP alone.** The same child on the same payload
-behaves very differently depending on what the *parent* has loaded:
+**It is memory, not OpenMP** — this was written as a hypothesis and is now the
+confirmed cause; see the top of this section. The same child on the same payload
+behaves very differently depending on what the *parent* has loaded, because
+parent and child compete for one system-wide commit limit:
 
 | parent holds | child outcome (chunk=1000) |
 |---|---|
@@ -586,22 +701,28 @@ behaves very differently depending on what the *parent* has loaded:
 
 These are separate processes, so this looked inexplicable at first. It is not
 the inherited environment (`import faiss` changes nothing in `os.environ` —
-checked) and not the CPU affinity mask (`0xff` before and after — checked).
+checked) and not the CPU affinity mask (`0xff` before and after — checked, but
+see the redirector-stub gotcha below: if that check was aimed at `Popen.pid` it
+was reading the launcher, not the interpreter. It no longer matters — the answer
+is that both processes draw on one system-wide commit limit).
 
 Then a test run launched *while a build was already running* failed with
 `OpenBLAS error: Memory allocation still failed after 10 retries, giving up.`
 — an explicit allocation failure, not a segfault. That is the first direct
 evidence of what is actually going on: **this box has 16 GB, an encode child
-wants ~2 GB, and every extra thing the parent holds (faiss, the DataFrame,
-another encode process) eats the headroom.** It fits everything: crash
-probability rising with texts per process, the `import faiss` parent being
-worst, and my own concurrent measurements making things worse.
+wanted ~2.9 GB at the batch size then in use, and every extra thing the parent
+holds (faiss, the DataFrame, another encode process) eats the headroom.** It
+fits everything: crash probability rising with texts per process, the `import
+faiss` parent being worst, and my own concurrent measurements making things
+worse. What this still missed is that the 16 GB was never the ceiling — with no
+page file the *commit* limit is what binds, and free commit ran to a few
+hundred MB.
 
-Treat that as the leading hypothesis rather than a settled cause — the failures
-are usually 0xC0000005 rather than a clean allocation error. But it means
-**don't run anything heavy while an index build is going**, and it makes the
-chunking fix look right for the right reason: smaller chunks need less resident
-memory, not just less time.
+That was recorded as a leading hypothesis, hedged because the failures are
+usually 0xC0000005 rather than a clean allocation error. **The hedge was
+unnecessary** — on Windows an uncommittable allocation *is* a 0xC0000005 as soon
+as the caller skips the NULL check, so the two are the same observation. It
+still means **don't run anything heavy while an index build is going**.
 
 `rag.py` now also imports faiss **lazily**, after `encode_bulk` returns, so a
 fresh index build encodes before faiss is loaded in that process. Once loaded it
@@ -614,12 +735,17 @@ runtimes loaded", "affinity 0x0" — because `ctypes` truncates the 64-bit
 zeroed affinity mask is impossible and should have been obviously wrong. Always
 sanity-check a Win32 probe against a value you already know.
 
-**Still open, deliberately:** query embedding stays in-process (one short string,
-never observed crashing; a subprocess per query would add a model load to every
-question). `FORENSICS_EMBED_IN_PROCESS=1` disables subprocessing entirely.
-**The durable fix is environmental** — get faiss, torch and sklearn onto a single
-OpenMP runtime (matching wheels, or a conda-forge stack). Until then the code
-only contains the damage.
+**"Query embedding stays in-process, never observed crashing" — it crashed.**
+That note reasoned about the *encode* (one short string, trivial) and missed
+that the cost is the **model load**, which is ~1,040 MB whether the string is
+one word or ten thousand. It failed with error 1455 on the first query after an
+index build. It now falls back to a child on a memory error.
+`FORENSICS_EMBED_IN_PROCESS=1` still disables subprocessing entirely.
+
+**The durable fix is environmental, but not the one recorded here.** It is not
+about getting faiss/torch/sklearn onto one OpenMP runtime — it is
+**enable a page file**. Until then the code is fitting into a commit limit that
+happens to equal RAM.
 
 ### 5. The ML model is close to useless as-is
 `AnomalyScore == -1` fires on **30.1%** of artifacts (23,068 / 76,693) on the
@@ -669,8 +795,35 @@ have no hive. Only `Jimmy Wilson` does. Don't chase this.
   The extractor phase sat in this document at ~1,070s while it was really 67s;
   the same commit that fixed the walk had sped the extractors up too. A whole
   decision (`CARVE_MAX_WORKERS`) was made twice against that stale number.
+- **On Windows, watch available *commit*, not available RAM.** They differed by
+  3 GB here and only one of them governs whether an allocation succeeds. This
+  box has no page file, so its commit limit *is* physical RAM
+  (`ullTotalPageFile == ullTotalPhys` — that equality is the test). Free RAM
+  read 3.7 GB while free commit was 369 MB, which is why three sessions looked
+  at memory and saw nothing wrong.
+- **A `0xC0000005` with no traceback is an out-of-memory until proven
+  otherwise.** An allocation Windows cannot commit returns NULL and unchecked
+  native code dereferences it, which is byte-for-byte what a wild pointer looks
+  like. This project spent three sessions attributing those to mixed OpenMP
+  runtimes. The runtimes really were mixed; they just weren't the problem.
+  When the same failure surfaces cleanly it says so — `OSError: The paging file
+  is too small for this operation to complete. (os error 1455)`.
+- **Match OS error messages, not just codes, across a Rust boundary.**
+  `safetensors` raises its `std::io::Error` as a bare Python `OSError` with no
+  `.winerror`. `"[WinError 1455]"` means Python raised it and the code is
+  available; `"(os error 1455)"` means Rust did and only the string is.
+- **`.venv/Scripts/python.exe` is a redirector stub, not the interpreter.** It
+  spawns the real python as a *separate process*, so `Popen.pid` names something
+  that allocates about 1 MB. A child holding 700 MB measured as 0.8 MB. Any
+  per-process probe (memory, affinity, handles) aimed at that pid is measuring
+  the wrong process — have the child report its own numbers instead.
+- **Tune the dial the resource is actually on.** Three sessions tuned
+  `FORENSICS_EMBED_CHUNK` (texts per *process*) while peak memory was set by
+  `batch_size` (texts per *forward pass*), which sat at 256 the whole time —
+  and was pinned by the caller, so the module default never applied. Check that
+  a default is reachable before concluding it is wrong.
 - **Don't run anything heavy while an index build is going.** Encode children
-  want ~2 GB each on a 16 GB box, and a second Python process tipped one build
+  want ~1.2 GB each on this box, and a second Python process tipped one build
   from steady progress into its stall limit — my own measurement run caused the
   only stall-out this design has had. It also invalidates whatever you were
   measuring: an `OpenBLAS` allocation failure is what finally revealed the
@@ -698,7 +851,10 @@ have no hive. Only `Jimmy Wilson` does. Don't chase this.
 - **Don't read through a handle that is mid-iteration.** Collect names first,
   then read. This is the single most expensive bug class here.
 - Widening `EMBED_TYPES` in `rag.py` invalidates the cached FAISS index and forces
-  a ~50-minute re-embed. Use `LEXICAL_TYPES` for low-volume artifact types.
+  a full re-embed of ~60k texts. Use `LEXICAL_TYPES` for low-volume artifact
+  types. The old "~50 minutes" here predates the batch-size fix; extrapolating
+  from the tail of the completed build it should now be ~15 min, but nobody has
+  timed a rebuild from zero — say so rather than quoting the estimate as fact.
 - Windows security Event IDs only mean what they're documented to mean **in the
   Security channel** — always constrain with `sources`.
 - Test scripts must encode output as ASCII before printing; the Windows console
