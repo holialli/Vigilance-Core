@@ -1,5 +1,6 @@
 """FAISS-backed retrieval over activity artifacts."""
 
+import hashlib
 import os
 import re
 import time
@@ -87,6 +88,38 @@ def _normalize_for_embedding(txt: str) -> str:
     txt = re.sub(r'([A-Za-z]:\\|/)[^\s|]+[\\/]', '<PATH>/', txt)
     return txt.strip()
 
+def _embed_fingerprint(embed_df):
+    """Identity of the rows an index's vectors are positionally bound to.
+
+    Order is part of the identity, deliberately: retrieval resolves vector i to
+    `embed_df.iloc[i]`, so two frames holding the same texts in a different
+    order are not interchangeable.
+    """
+    h = hashlib.sha256()
+    h.update(f"{len(embed_df)}:".encode())
+    for t in embed_df['Task Category'].fillna('').astype(str):
+        h.update(t.encode("utf-8", "replace"))
+        h.update(b"\0")
+    return h.hexdigest()[:16]
+
+
+def _fingerprint_path(cache_file):
+    return cache_file + ".fingerprint"
+
+
+def _read_fingerprint(cache_file):
+    path = _fingerprint_path(cache_file)
+    if not os.path.exists(path):
+        return None          # pre-dates fingerprinting: treat as unverifiable
+    with open(path, encoding="utf-8") as fh:
+        return fh.read().strip()
+
+
+def _write_fingerprint(cache_file, fingerprint):
+    with open(_fingerprint_path(cache_file), "w", encoding="utf-8") as fh:
+        fh.write(fingerprint)
+
+
 def build_rag_context(query, session, top_k=8):
     if session.current_audit_df is None:
         return [], ""
@@ -109,20 +142,50 @@ def build_rag_context(query, session, top_k=8):
                 cache_file = os.path.join(case_dir, "faiss.index")
 
             # ── REQ-4: Validate cache against filtered embed_df, not full df ─
+            # Against its *contents*, not just its length. Vector i is looked up
+            # as embed_df row i, so a reordering of equal-length data repoints
+            # every citation at a different artifact — and unlike a crash, the
+            # answer still reads as properly sourced. That is exactly what
+            # happened when re-scoring a cached carve permuted rows inside
+            # timestamp ties: 51,195 of 60,414 positions moved and `ntotal ==
+            # len(embed_df)` was still true. See `_embed_fingerprint`.
             if cache_file and os.path.exists(cache_file):
-                print(f"  [FAISS] Loading cached index: {session.image_hash_sha256[:16]}...")
-                import faiss
-                loaded_index = faiss.read_index(cache_file)
-                if loaded_index.ntotal == len(embed_df):
-                    session.faiss_index = loaded_index
-                    print(f"  [FAISS] Cache valid ({loaded_index.ntotal} vectors).")
-                else:
+                # Check the sidecar *before* touching the index. Reading it
+                # imports faiss and allocates the whole thing (93 MB on this
+                # case) — in the one process that is about to need every byte it
+                # can get for a re-encode. Doing that first segfaulted the
+                # parent outright. The fingerprint is a 16-byte file, and if it
+                # does not match, the index is not worth opening.
+                want = _embed_fingerprint(embed_df)
+                have = _read_fingerprint(cache_file)
+                if have != want:
                     print(
-                        f"  [WARN] Cache size mismatch "
-                        f"({loaded_index.ntotal} cached vs {len(embed_df)} filtered). "
-                        f"Rebuilding..."
+                        f"  [WARN] Cached index was built from a different "
+                        f"artifact ordering or text set "
+                        f"({have or 'no fingerprint recorded'} != {want}). "
+                        f"Its vectors no longer line up with these rows, so "
+                        f"citations would resolve to the wrong evidence. "
+                        f"Rebuilding without loading it."
                     )
                     session.faiss_index = None
+                else:
+                    print(f"  [FAISS] Loading cached index: "
+                          f"{session.image_hash_sha256[:16]}...")
+                    import faiss
+                    loaded_index = faiss.read_index(cache_file)
+                    # The fingerprint already covers the row count, so this can
+                    # only fail if the two files disagree with each other.
+                    if loaded_index.ntotal == len(embed_df):
+                        session.faiss_index = loaded_index
+                        print(f"  [FAISS] Cache valid ({loaded_index.ntotal} vectors).")
+                    else:
+                        print(
+                            f"  [WARN] Index and fingerprint disagree "
+                            f"({loaded_index.ntotal} vectors vs "
+                            f"{len(embed_df)} rows). Rebuilding..."
+                        )
+                        session.faiss_index = None
+                        del loaded_index
             # ─────────────────────────────────────────────────────────────────
 
             if session.faiss_index is None:
@@ -184,6 +247,7 @@ def build_rag_context(query, session, top_k=8):
 
                 if cache_file:
                     faiss.write_index(session.faiss_index, cache_file)
+                    _write_fingerprint(cache_file, _embed_fingerprint(embed_df))
 
                 elapsed = time.time() - t0
                 print(f"  [FAISS] Index ready — {session.faiss_index.ntotal} vectors "

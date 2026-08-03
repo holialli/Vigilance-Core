@@ -74,6 +74,14 @@ def handle_image_upload(files, session):
         df = pd.read_pickle(artifact_path)
         artifact_counts = df['ArtifactType'].str.lower().value_counts().to_dict()
         artifact_counts["total"] = len(df)
+        # Re-score even on a cache hit. artifacts.pkl caches *evidence*, which is
+        # a function of the image and cannot change; AnomalyScore is a function
+        # of the image **and** the model file, which changes independently of it.
+        # Storing them together meant a retrained model never reached a case that
+        # had already been carved — the pickle here was still serving labels from
+        # a model that flagged 37% of the image. Costs ~5s on 80k rows against
+        # the ~107s carve it is skipping.
+        df = engineer_features(df)
         status_msg = (
             f"Forensic Image Loaded: {len(df)} artifacts recovered. "
             f"SHA-256: {image_hash_sha256}"

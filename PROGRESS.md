@@ -167,6 +167,58 @@ src/forensics/
   COMMUNICATION artifacts were *never indexed at all*. Rewrote as hybrid
   retrieval: semantic (FAISS) + lexical + query→artifact-type routing.
 
+### The index can silently point at the wrong evidence — FIXED
+
+Found while re-scoring a cached carve with the retrained model, and it is the
+worst class of bug this project has had: **it does not fail, it lies.**
+
+`build_rag_context` resolves FAISS vector *i* to `embed_df.iloc[i]` — a purely
+positional binding — and validated a cached index with
+`loaded_index.ntotal == len(embed_df)`. **A count.** So any reordering of the
+artifact frame leaves the check passing while every citation resolves to a
+different artifact than the one the vector came from. The answer still carries
+`[E1]` tags, the appendix still resolves them to real rows, and nothing anywhere
+reports a problem. For a tool whose entire claim is grounded evidence, that is
+the failure that matters most.
+
+**What reordered it.** `compute_features` sorts by timestamp, and pandas
+defaults to quicksort, which is **not stable**. This image has 80,191 rows
+across only 5,945 distinct timestamps, with one tie group of **13,222 rows** —
+so re-sorting an already-sorted frame permuted it. Measured: **51,195 of 60,414
+embed positions moved**, and `ntotal == len(embed_df)` was still true.
+
+Two fixes, because either alone is insufficient:
+
+- `sort_values(..., kind='stable')`. Sorting sorted data is now a no-op, so
+  scoring is idempotent. Verified on the real carve: order-preserving across one
+  pass and identical across two.
+- **The index cache carries a fingerprint of the exact rows it was built from**
+  (`faiss.index.fingerprint`, a hash of `embed_df['Task Category']` *in order*).
+  Order is deliberately part of the identity — the same texts in a different
+  order are a different index. A missing sidecar reads as "cannot vouch for
+  this" and rebuilds, so pre-fingerprint indexes are not trusted by default.
+
+The stable sort prevents today's cause; the fingerprint catches every future
+one, including causes nobody has thought of. **A positional binding between two
+independently-cached artifacts needs a content check, not a length check** — the
+same lesson `embed_chunks/` already learned about chunk reuse, arrived at
+separately and one layer up.
+
+**And check the fingerprint before opening the index, not after.** The first
+version read the index, *then* compared fingerprints — which meant importing
+faiss and allocating the whole 93 MB in order to conclude the file was useless,
+inside the one process about to need every byte it could get for a re-encode.
+That segfaulted the parent outright (`exit=139`), taking the rebuild with it.
+The sidecar is 16 bytes; if it does not match, the index is not worth opening.
+Note this also defeats the lazy `import faiss` — deferring the import buys
+nothing if the validation path imports it anyway, on exactly the run that is
+about to rebuild.
+
+**A background task reporting "exit code 0" was the shell wrapper, not python.**
+The real line was `Segmentation fault … exit=139`, and it was only in the task's
+own output file, not the redirected log. Read the process's actual status before
+believing a build succeeded.
+
 ### Triage / Timeline / Search tabs (`8d09a1e`)
 - **Triage** runs on upload, severity-ranked, channel-scoped rules.
 - **Timeline** — daily/hourly/weekly buckets, filterable.

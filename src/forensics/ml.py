@@ -40,7 +40,14 @@ def compute_features(df):
     Returns the frame sorted by timestamp, with FEATURE_COLUMNS populated.
     """
     ts = pd.to_datetime(df['Date and Time'], errors='coerce')
-    df = df.assign(_ts=ts).sort_values('_ts').reset_index(drop=True)
+    # kind='stable' is load-bearing, not a style choice. pandas defaults to
+    # quicksort, which reorders equal keys arbitrarily — and this data has
+    # 80,191 rows across 5,945 distinct timestamps, with one tie group of
+    # 13,222. Re-scoring an already-sorted frame therefore *permuted* it, and
+    # `build_rag_context` maps FAISS vector i to embed_df row i positionally,
+    # so every citation silently began pointing at a different artifact. A
+    # stable sort makes this idempotent: sorting sorted data is a no-op.
+    df = df.assign(_ts=ts).sort_values('_ts', kind='stable').reset_index(drop=True)
 
     # An unparseable timestamp used to become "hour 12", inventing a noon spike
     # out of missing data. -1 keeps it a distinct value the model can isolate on

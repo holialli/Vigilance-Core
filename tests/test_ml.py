@@ -104,6 +104,45 @@ def test_unparseable_timestamp_does_not_become_noon():
     assert compute_features(df)['HourOfDay'].iloc[0] == -1
 
 
+def test_rescoring_does_not_reorder_rows():
+    """Retrieval binds FAISS vector i to embed_df row i, so a reordering
+    repoints every citation at a different artifact while the answer still
+    reads as properly sourced. pandas sorts with quicksort by default, which
+    permutes equal keys — and the real image has 80,191 rows over 5,945
+    distinct timestamps, one tie group holding 13,222 of them. Sorting
+    already-sorted data has to be a no-op."""
+    rows = pd.DataFrame([{
+        'Date and Time': '2024-03-01 04:00:00', 'Event ID': str(i),
+        'Task Category': f'artifact number {i}', 'LogSource': 'SECURITY',
+        'Keywords': 'None', 'ArtifactType': 'EVTX',
+    } for i in range(400)])          # every row shares one timestamp
+
+    once = compute_features(rows)
+    twice = compute_features(once.copy())
+
+    assert once['Task Category'].tolist() == twice['Task Category'].tolist(), \
+        "re-scoring permuted rows inside a timestamp tie"
+    assert twice['Task Category'].tolist() == rows['Task Category'].tolist(), \
+        "sorting reordered rows that were already in order"
+
+
+def test_stale_scores_are_recomputed_not_preserved(artifact_df):
+    """A cached carve carries the labels of whatever model scored it. Evidence
+    is a function of the image and safe to cache; the score is a function of the
+    image *and* the model file, which changes independently — so re-scoring has
+    to overwrite, or a retrained model never reaches an already-carved case."""
+    stale = artifact_df.copy()
+    stale["AnomalyScore"] = -1
+    stale["AnomalyLabel"] = "STATISTICAL ANOMALY (Behavioral)"
+    stale["EventsPerMinute"] = 101          # the old capped value
+
+    out = engineer_features(stale)
+
+    assert not (out["AnomalyLabel"] == "STATISTICAL ANOMALY (Behavioral)").all(), \
+        "kept the stale labels instead of re-scoring"
+    assert (out["EventsPerMinute"] != 101).any(), "kept the stale feature values"
+
+
 def test_training_and_inference_share_one_feature_definition():
     """isolation_model.py imports this rather than reimplementing it. The last
     train/serve skew was a 50-row lookback at inference against 100 in
