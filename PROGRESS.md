@@ -21,9 +21,14 @@ coverage; competing on the AI/triage layer Autopsy doesn't have.
 **State:** clean. `main` at `b12f998`, working tree clean, 142 tests passing,
 NIST re-validated 11/11 through a full carve. Nothing is half-finished.
 
-**In flight:** nothing. The IACIS case (`6c18f662…`) now has a complete
-`faiss.index` — 60,414 vectors — and three test queries return real evidence off
-it. That had been the outstanding blocker for three sessions.
+**In flight:** nothing. The IACIS case (`6c18f662…`) has a complete
+`faiss.index` — 60,414 vectors — rebuilt from a **full 121-chunk encode that ran
+start to finish with zero stalls** (1,269s), which had never happened before.
+Three test queries return real evidence off it, the cached index is accepted on
+reload via its fingerprint, and **alignment is verified directly**: 44 of 44
+sampled rows (including both ends of the frame) find their own vector at their
+own position. The remaining differences are rows sharing a normalised text, so
+sharing a vector by design.
 
 **Next, in the order I'd do it:**
 
@@ -203,6 +208,15 @@ one, including causes nobody has thought of. **A positional binding between two
 independently-cached artifacts needs a content check, not a length check** — the
 same lesson `embed_chunks/` already learned about chunk reuse, arrived at
 separately and one layer up.
+
+**Verify alignment directly, not by inference.** `alignment_check.py` (session
+scratchpad) takes a row, embeds its own text, asks the index for the nearest
+vector and checks the answer is that row's position. A misaligned index fails it
+on the first sample; matching row counts never will. Current result: **44/44,
+including positions 0, 1, n-2 and n-1** — the boundaries, where an off-by-one
+would otherwise hide. Rows that resolve to a *different* position because they
+share a normalised text are ties, not misalignments, and the check distinguishes
+them rather than counting them as passes.
 
 **And check the fingerprint before opening the index, not after.** The first
 version read the index, *then* compared fingerprints — which meant importing
