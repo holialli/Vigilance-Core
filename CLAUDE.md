@@ -2,13 +2,19 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+Read `PROGRESS.md` too — it is the running engineering log, and it records which
+past conclusions turned out to be wrong. Several of them were expensive.
+
 ## What this is
 
 AI Forensic Engine — a digital forensics analysis tool that ingests raw disk images (`.dd`/`.raw`/`.E01`),
 carves artifacts (EVTX logs, registry hives, filesystem metadata, browser/user activity, USB/prefetch/SRUM),
 scores them with an Isolation Forest anomaly model, indexes them with FAISS for retrieval, and answers
 natural-language investigator questions via an LLM (Gemini/Groq/Ollama) grounded in the retrieved evidence.
-The UI is a single Gradio app. Nearly all application logic lives in one file: `src/chatbot_app.py` (~3200 lines).
+
+The UI is a single Gradio app (`src/chatbot_app.py`, ~840 lines). **Everything else lives in the
+`src/forensics/` package** — the 3,200-line monolith was split in `c1b8e4c`, and any guidance describing
+one big file is out of date.
 
 ## Running the app
 
@@ -19,9 +25,14 @@ python src/chatbot_app.py
 Opens a Gradio app on `http://localhost:7860`. Upload a `.dd`/`.raw`/`.E01` image via the UI, wait for
 carving + FAISS index build, then use the "AI Investigation" chat, "Dashboard & Summary", or "Raw Artifacts" tabs.
 
-Requires `src/.env` with at least one LLM configured — the app raises `RuntimeError` at import time
-(`chatbot_app.py` line ~151) if none of `GEMINI_API_KEY`, `GROQ_API_KEY`, or a reachable local Ollama
-(`OLLAMA_BASE_URL`, default `http://localhost:11434`) is available. Copy `.env.example` to `src/.env` to configure.
+Requires `src/.env` with at least one LLM configured. `forensics.llm.ensure_llm_available()` raises
+`RuntimeError` **at app startup, not at import** (deliberately — tests import the package with no keys
+present) if none of `GEMINI_API_KEY`, `GROQ_API_KEY`, or a reachable local Ollama (`OLLAMA_BASE_URL`,
+default `http://localhost:11434`) is available. Copy `.env.example` to `src/.env` to configure.
+
+```bash
+python -m pytest tests/ -q     # 146 tests
+```
 
 ## Installing dependencies
 
@@ -39,67 +50,95 @@ platform notes (Windows recommended; Linux supported; macOS partial).
 cd src && python isolation_model.py
 ```
 
-Reads all CSVs in `src/data/`, engineers 3 behavioral features (`EventID`, `HourOfDay`, `EventsPerMinute`
-via a 60s rolling window), injects synthetic threat patterns for known malicious `EventID`s, trains an
-`IsolationForest` (300 estimators, contamination=0.02), and writes `src/models/forensic_alarm_v2.pkl`.
-`chatbot_app.py` fails fast at startup if this file is missing — run this script first on a fresh checkout
-if `src/models/forensic_alarm_v2.pkl` isn't present.
+Trains on **real carved artifacts** — every `src/cache/*/artifacts.pkl` on the machine — and writes
+`src/models/forensic_alarm_v2.pkl`. The app only ever *loads* that pickle; it never trains. Run this first
+on a fresh checkout if the pickle is missing.
 
-Synthetic training data can be regenerated with `src/scripts/generate_demo_logs.py` and
-`src/scripts/generate_registry_data.py`, which write into `src/data/`.
+Features come from `forensics.ml.compute_features`, which the training script **imports rather than
+reimplements**. Do not add a second copy of that arithmetic: the last train/serve skew was a 50-row
+lookback at inference against 100 in training, and neither file looked wrong on its own.
+
+If no carve is cached it falls back to the synthetic CSVs in `src/data/` with a loud warning. That
+fallback is a last resort, not a normal path — a model trained only on those CSVs flagged **37% of a real
+image**, because a real registry hive looks nothing like a synthetic event log. Regenerate the CSVs with
+`src/scripts/generate_demo_logs.py` and `src/scripts/generate_registry_data.py`.
+
+There is deliberately **no synthetic threat injection**. It used to add 50 copies each of seven "threat"
+patterns to the training set; an Isolation Forest calls *sparse* regions anomalous, so tight clusters of a
+pattern teach it that the pattern is normal — the opposite of the intent. Known-bad Event IDs are handled
+deterministically by `HEURISTIC_THREAT_IDS` in `config.py`, which is the right mechanism for them.
 
 ## Architecture
 
-`src/chatbot_app.py` is organized into five numbered sections (searchable via `# SECTION N:` header comments):
+```
+src/chatbot_app.py    Gradio UI only: handle_image_upload(), build_gui(), event wiring
+src/forensics/
+  config.py       paths, HEURISTIC_THREAT_IDS, hashset paths
+  session.py      CaseSession — all per-case state
+  parsers.py      EVTX, registry hive, SHA-256, EWFImgInfo
+  extractors.py   all extract_*, walk_filesystem, carve orchestrator  (~2,070 lines)
+  ml.py           compute_features / engineer_features, lazy model load
+  rag.py          hybrid retrieval + citations, FAISS index build
+  embedding.py    sentence embedding; bulk encode isolated in a subprocess
+  context.py      extract_system_context
+  llm.py          Ollama → Groq → Gemini → offline chain
+  reporting.py    PDF
+  analysis.py     search, timeline, triage, anomaly_overview
+  correlation.py  entity extraction + pivoting
+  cases.py        save/load/list cases
+  shimcache.py    AppCompatCache parser
+  hashsets.py     hashing + known-good/bad matching
+  recyclebin.py   INFO2 (XP) and $I (Vista+) record parsers
+```
 
-1. **Global State** (~L47) — per-case state (`current_audit_df`, `faiss_index`, `image_hash_sha256`,
-   `artifact_counts`, `cached_system_facts`, `session_log`) lives on a `CaseSession` instance, one per
-   browser session via `gr.State(value=CaseSession)` — **not** module globals, so concurrent investigators
-   don't clobber each other's case. Functions that need it take a `session: CaseSession` parameter; every
-   Gradio event handler in `build_gui()` has `session_state` wired into its `inputs=[...]`. Truly shared,
-   read-only-after-startup singletons stay as real module globals: `ai_model` (SentenceTransformer, guarded
-   by `_ai_model_lock` on first load), `ml_alarm` (loaded Isolation Forest), an in-memory SQLite `db_conn`
-   (created but currently unused — a stub for future cross-artifact correlation), and the Gemini/Groq/Ollama
-   client init (each optional, checked independently; see "LLM fallback chain" below).
-2. **Forensic Image Parsing** (~L161–1828) — the extraction layer. `carve_evidence_from_image()` (~L1694)
-   is the orchestrator: opens the image with `pytsk3` (raw) or `pyewf` via the custom `EWFImgInfo` adapter
-   class (`.E01`), probes partition offsets, then fans out ~16 independent `extract_*`/`walk_filesystem`
-   functions across a `ThreadPoolExecutor(max_workers=14)` — one task per artifact type (EVTX, SAM,
-   SOFTWARE, NTUSER, USB, prefetch, browser history, recycle bin, USN journal, SRUM, etc.). Each extractor
-   returns its own DataFrame; results are concatenated into one `current_audit_df`. Extractors are annotated
-   with `FIX-N` comments referencing specific past bugs (dir-type guards, dedup, isolated task execution) —
-   read the referenced fix before modifying an extractor to avoid reintroducing it.
-3. **Feature Engineering & ML** (~L1832) — `engineer_features()` derives the same 3-feature set used in
-   training and scores rows against `ml_alarm` for anomaly triage.
-4. **RAG / LLM** (~L1904) — `build_rag_context()` embeds only `EVTX/REGISTRY/SAM/SOFTWARE` artifact rows
-   (filesystem/MFT rows are deliberately excluded from the vector index — file-count questions are answered
-   separately via `extract_system_context()` metadata) via `all-MiniLM-L6-v2`, builds/caches a FAISS index
-   per image hash under `src/cache/<sha256>/faiss.index`, and returns top-k evidence for a query.
-   `query_llm()` builds a strict system prompt (grounded in `extract_system_context(session)`) and
-   tries providers in order — see below. `generate_pdf_report()` renders a case report via `reportlab`.
-5. **Upload Handler & GUI** (~L2641) — `handle_image_upload()` is the Gradio entry point: hashes the
-   uploaded image (SHA-256), checks `src/cache/<sha256>/artifacts.pkl` for a prior carve of the same image
-   before re-running extraction, then kicks off a background thread to warm the FAISS index. `build_gui()`
-   assembles the Gradio Blocks layout (dark theme, custom CSS) and wires all event handlers.
+**Session state.** Per-case state (`current_audit_df`, `faiss_index`, `image_hash_sha256`,
+`artifact_counts`, `cached_system_facts`, `index_error`, `session_log`) lives on a `CaseSession`, one per
+browser session via `gr.State(value=CaseSession)` — **not** module globals, so concurrent investigators
+don't clobber each other's case. Functions that need it take a `session: CaseSession` parameter, and every
+Gradio handler in `build_gui()` has `session_state` in its `inputs=[...]`.
+
+**Carving.** `carve_evidence_from_image()` in `extractors.py` opens the image with `pytsk3` (raw) or
+`pyewf` via the `EWFImgInfo` adapter (`.E01`, all segments), probes partition offsets, builds one shared
+path index, then runs ~16 `extract_*`/`walk_filesystem` functions — **serially by default**
+(`CARVE_MAX_WORKERS=1`). Threading was measured and it both loses on speed and silently drops evidence;
+see PROGRESS.md item 1 before reaching for a thread pool again. Extractors carry `FIX-N` comments naming
+specific past bugs — read the referenced fix before modifying one.
+
+**Retrieval.** `build_rag_context()` embeds only `EVTX/REGISTRY/SAM/SOFTWARE` rows (`EMBED_TYPES`) via
+`all-MiniLM-L6-v2`; low-volume high-value types (`LEXICAL_TYPES`: USB, BROWSER, PREFETCH, RECYCLE, …) are
+scanned lexically on every query instead, so adding one never invalidates a built index. Retrieval is
+hybrid: semantic + lexical + query→artifact-type routing. `query_llm()` builds a grounded system prompt
+and requires inline `[E1]` citations, which the UI resolves into an evidence appendix.
 
 ### LLM fallback chain
 
-`query_llm()` (~L2564) tries providers in fixed priority order and falls through on failure/absence:
+`query_llm()` tries providers in fixed priority order and falls through on failure/absence:
 **Ollama (local) → Groq (cloud) → Gemini (cloud) → deterministic offline summary**
-(`build_offline_response()`, which returns system facts + raw evidence with no LLM). Any subset of
-providers may be configured; the app only refuses to start if *none* are available.
+(`build_offline_response()`, system facts + raw evidence, no LLM). Any subset may be configured.
 
 ### Caching
 
-Per-image-hash caching lives under `src/cache/<sha256>/`: `artifacts.pkl` (carved DataFrame, skips
-re-extraction on repeat upload) and `faiss.index` (vector index, invalidated/rebuilt if its vector count
-doesn't match the current filtered artifact set). `src/cache/embedding_cache.pkl` is a separate
-sentence-embedding cache keyed by normalized text (`_normalize_for_embedding()`) to raise cache-hit rate
-across images with similar log text.
+Per-image-hash, under `src/cache/<sha256>/`:
 
-### Isolation Forest model
+- `artifacts.pkl` — carved DataFrame; a repeat upload of the same image skips extraction entirely.
+- `faiss.index` — vector index, rebuilt if its vector count doesn't match the current filtered set.
+- `embed_chunks/` — partial encode output, so an index build that fails resumes instead of restarting.
+  Carries a fingerprint of the text set and chunk size; stale chunks are discarded rather than reused.
 
-`src/isolation_model.py` is a standalone training script (not imported by the app) — run it manually to
-regenerate `src/models/forensic_alarm_v2.pkl`. `chatbot_app.py` only ever *loads* this pickle at startup;
-it never trains. If artifact feature engineering changes in `chatbot_app.py::engineer_features()`, keep the
-feature set (`EventID`, `HourOfDay`, `EventsPerMinute`) in sync with `isolation_model.py`.
+`src/cache/embedding_cache.pkl` (14 MB) is **orphaned** — no code references it. It predates the package
+split. Left in place rather than deleted, but do not treat it as a live cache.
+
+### Memory: read this before debugging a crash in the index build
+
+The encode step runs in a **child process** because a native crash there would otherwise take the Gradio
+server down, and `except Exception` cannot catch one. On a Windows box with no page file the commit limit
+is physical RAM, and an encode child at the old `batch_size=256` peaked at 2,871 MB — more than was free.
+
+**A `0xC0000005` with no traceback from an encode child is an out-of-memory until proven otherwise.** Check
+`GlobalMemoryStatusEx().ullAvailPageFile`, not free RAM; they differed by 3 GB on this machine. Three
+sessions were spent attributing these to mixed OpenMP runtimes. Tuning knobs: `FORENSICS_EMBED_BATCH` (32,
+this is the one that sets peak memory), `FORENSICS_EMBED_CHUNK` (500, resumption granularity only),
+`FORENSICS_EMBED_IN_PROCESS=1` to disable subprocessing. Don't run anything heavy alongside a build.
+
+Also: `.venv/Scripts/python.exe` is a redirector stub that spawns the real interpreter as a separate
+process, so `Popen.pid` is **not** the process doing the work. Per-process probes aimed at it measure ~1 MB.

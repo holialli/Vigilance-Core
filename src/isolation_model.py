@@ -1,166 +1,138 @@
-"""
-═══════════════════════════════════════════════════════════════════════
-  FORENSIC IMAGE ANALYSIS ENGINE — Behavioral ML Training Script
-  Version: 2.0 (3-Feature Isolation Forest)
-═══════════════════════════════════════════════════════════════════════
-  Features:  EventID  |  HourOfDay  |  EventsPerMinute
-  Model:     Isolation Forest (n_estimators=300, contamination=0.02)
-  Output:    models/forensic_alarm_v2.pkl
-═══════════════════════════════════════════════════════════════════════
+"""Train the behavioural anomaly model.
+
+    cd src && python isolation_model.py
+
+Writes models/forensic_alarm_v2.pkl, which chatbot_app.py loads at startup and
+never trains.
+
+**Trains on real carved artifacts**, taken from src/cache/<sha256>/artifacts.pkl,
+and falls back to the synthetic CSVs in src/data/ only when no carve exists.
+The previous version trained on the synthetic CSVs alone, and the result was a
+model that flagged **37% of a real image** — every one of them a "STATISTICAL
+ANOMALY (Behavioral)", including 945 copies of an ordinary
+`ControlSet002\\Control` registry key. That is not a bad threshold, it is
+train/serve distribution skew: to a model that has only ever seen synthetic
+event logs, a real registry hive is entirely anomalous.
+
+Features come from `forensics.ml.compute_features` — imported, not
+reimplemented. Two independent copies of that arithmetic is how the last skew
+got in (a 50-row lookback at inference against 100 in training), and it is not
+detectable by reading either file on its own.
+
+There is deliberately **no synthetic threat injection** any more. It used to add
+50 copies each of seven "threat" patterns to the training set, intending to
+teach the model to catch them. An Isolation Forest learns where the data is
+*dense* and calls the sparse parts anomalous, so 50 tight copies of a pattern
+teach it that the pattern is normal — the opposite of the intent. Those Event
+IDs are covered deterministically by HEURISTIC_THREAT_IDS, which is the right
+mechanism for "this ID is always worth surfacing".
 """
 
-import pandas as pd
-import numpy as np
-from sklearn.ensemble import IsolationForest
-from datetime import datetime, timedelta
-import joblib
+import glob
 import os
-import random
+import sys
+
+import joblib
+import pandas as pd
+from sklearn.ensemble import IsolationForest
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, SCRIPT_DIR)
 
-# ─────────────────────────────────────────────────────────────────────
-# 1. LOAD TRAINING DATA
-# ─────────────────────────────────────────────────────────────────────
-data_dir = os.path.join(SCRIPT_DIR, "data")
-frames = []
+from forensics.ml import FEATURE_COLUMNS, compute_features  # noqa: E402
 
-for csv_file in os.listdir(data_dir):
-    if csv_file.endswith(".csv"):
-        path = os.path.join(data_dir, csv_file)
-        print(f"  📂 Loading: {path}")
-        df = pd.read_csv(path, low_memory=False)
-        df.columns = df.columns.str.strip()
+# Share of training rows the model is told to treat as outliers. This is the
+# flag rate on data that looks like the training set, so it is the dial for
+# "how much does an examiner have to read". 2% of 80k is still 1,600 rows.
+CONTAMINATION = float(os.getenv("FORENSIC_CONTAMINATION", "0.02"))
+
+
+def load_real_carves():
+    """Every cached carve on this machine, concatenated."""
+    frames = []
+    pattern = os.path.join(SCRIPT_DIR, "cache", "*", "artifacts.pkl")
+    for path in sorted(glob.glob(pattern)):
+        try:
+            df = pd.read_pickle(path)
+        except Exception as e:
+            print(f"  [skip] {path}: {e}")
+            continue
+        if "Date and Time" not in df.columns or "Event ID" not in df.columns:
+            print(f"  [skip] {path}: not a carved artifact frame")
+            continue
+        print(f"  [carve] {os.path.basename(os.path.dirname(path))[:16]}… "
+              f"{len(df):,} rows")
         frames.append(df)
-
-if not frames:
-    print("❌ No CSV files found in data/ directory.")
-    exit(1)
-
-df = pd.concat(frames, ignore_index=True)
-print(f"\n  ✅ Loaded {len(df)} total rows from {len(frames)} file(s).\n")
+    return frames
 
 
-# ─────────────────────────────────────────────────────────────────────
-# 2. FEATURE ENGINEERING
-# ─────────────────────────────────────────────────────────────────────
-print("  🔧 Engineering behavioral features...\n")
-
-# Feature 1: EventID (numeric)
-df['EventID'] = pd.to_numeric(
-    df.get('Event ID', df.get('Source', pd.Series(dtype='str'))),
-    errors='coerce'
-).fillna(0).astype(int)
-
-# Feature 2: HourOfDay (0-23)
-def extract_hour(dt_str):
-    try:
-        dt = pd.to_datetime(str(dt_str))
-        return dt.hour
-    except Exception:
-        return 12  # Default to noon for unparseable
-    
-df['HourOfDay'] = df['Date and Time'].apply(extract_hour)
-
-# Feature 3: EventsPerMinute
-# Sort by time, then count events in a rolling 60-second window
-df['_timestamp'] = pd.to_datetime(df['Date and Time'], errors='coerce')
-df = df.sort_values('_timestamp').reset_index(drop=True)
-
-events_per_min = []
-timestamps = df['_timestamp'].tolist()
-for i, ts in enumerate(timestamps):
-    if pd.isna(ts):
-        events_per_min.append(1)
-        continue
-    window_start = ts - timedelta(seconds=60)
-    count = 0
-    for j in range(max(0, i - 100), i + 1):  # Look back up to 100 rows
-        ts_j = timestamps[j]
-        if pd.notna(ts_j) and window_start <= ts_j <= ts:
-            count += 1
-    events_per_min.append(count)
-
-df['EventsPerMinute'] = events_per_min
-
-print(f"  📊 Feature Stats:")
-print(f"     EventID range:         {df['EventID'].min()} — {df['EventID'].max()}")
-print(f"     HourOfDay range:       {df['HourOfDay'].min()} — {df['HourOfDay'].max()}")
-print(f"     EventsPerMinute range: {min(events_per_min)} — {max(events_per_min)}")
-print()
+def load_synthetic_csvs():
+    frames = []
+    data_dir = os.path.join(SCRIPT_DIR, "data")
+    for csv_file in sorted(os.listdir(data_dir)):
+        if not csv_file.endswith(".csv"):
+            continue
+        df = pd.read_csv(os.path.join(data_dir, csv_file), low_memory=False)
+        df.columns = df.columns.str.strip()
+        print(f"  [csv] {csv_file}: {len(df):,} rows")
+        frames.append(df)
+    return frames
 
 
-# ─────────────────────────────────────────────────────────────────────
-# 3. INJECT SYNTHETIC THREAT PATTERNS
-# ─────────────────────────────────────────────────────────────────────
-print("  💉 Injecting synthetic threat patterns...\n")
+def main():
+    print("Loading training data...")
+    frames = load_real_carves()
+    source = "real carved artifacts"
 
-synthetic_threats = []
-threat_templates = [
-    # EventID, HourOfDay (late night), EventsPerMinute (burst)
-    (1102, 3, 15),   # Audit log cleared at 3 AM, high burst
-    (4720, 2, 12),   # Account created at 2 AM, burst
-    (4625, 4, 45),   # Brute force at 4 AM, extreme burst
-    (9999, 1, 8),    # Suspicious process at 1 AM
-    (0,    3, 20),   # Kernel event at 3 AM, burst
-    (8000, 2, 10),   # Registry persistence at 2 AM
-    (8001, 3, 5),    # Security bypass at 3 AM
-]
+    if not frames:
+        print("\n  [WARN] No carved images found under src/cache/.")
+        print("  [WARN] Falling back to the synthetic CSVs in src/data/.")
+        print("  [WARN] A model trained on these flagged 37% of a real image —")
+        print("  [WARN] carve a real image first if you have one.")
+        frames = load_synthetic_csvs()
+        source = "synthetic CSVs (NOT representative — see the warning above)"
 
-for eid, hour, epm in threat_templates:
-    for _ in range(50):  # 50 copies of each pattern
-        synthetic_threats.append({
-            'EventID': eid,
-            'HourOfDay': hour + random.randint(-1, 1),  # Slight variation
-            'EventsPerMinute': epm + random.randint(-2, 5),
-        })
+    if not frames:
+        print("No training data found in src/cache/ or src/data/.")
+        return 1
 
-synthetic_df = pd.DataFrame(synthetic_threats)
+    df = pd.concat(frames, ignore_index=True)
+    print(f"\n{len(df):,} rows from {len(frames)} source(s): {source}\n")
 
-# Combine real features + synthetic threats
-feature_cols = ['EventID', 'HourOfDay', 'EventsPerMinute']
-X_real = df[feature_cols].copy()
-X = pd.concat([X_real, synthetic_df[feature_cols]], ignore_index=True)
+    print("Engineering features (shared with inference)...")
+    df = compute_features(df)
+    X = df[FEATURE_COLUMNS]
 
-print(f"  📈 Training set: {len(X)} rows ({len(X_real)} real + {len(synthetic_df)} synthetic)\n")
+    for col in FEATURE_COLUMNS:
+        s = X[col]
+        print(f"  {col:<16} min {s.min():>8,.0f}  median {s.median():>8,.0f}  "
+              f"max {s.max():>10,.0f}  distinct {s.nunique():>7,}")
 
+    print(f"\nTraining Isolation Forest (contamination={CONTAMINATION})...")
+    model = IsolationForest(
+        n_estimators=300,
+        contamination=CONTAMINATION,
+        max_samples='auto',
+        random_state=42,
+        n_jobs=-1,
+    )
+    model.fit(X.values)
 
-# ─────────────────────────────────────────────────────────────────────
-# 4. TRAIN ISOLATION FOREST
-# ─────────────────────────────────────────────────────────────────────
-print("  🧠 Training Isolation Forest (v2 — Behavioral)...")
+    predictions = model.predict(X.values)
+    n_anomalies = int((predictions == -1).sum())
+    print(f"\n  flagged on its own training data: {n_anomalies:,} / "
+          f"{len(predictions):,} ({n_anomalies / len(predictions) * 100:.1f}%)")
+    print("  (should land near the contamination rate; far above it means the "
+          "training data does not look like what the app will score)")
 
-model = IsolationForest(
-    n_estimators=300,
-    contamination=0.02,
-    max_samples='auto',
-    random_state=42,
-    n_jobs=-1,
-)
-
-model.fit(X.values)
-
-# Quick self-test
-predictions = model.predict(X.values)
-n_anomalies = (predictions == -1).sum()
-n_normal = (predictions == 1).sum()
-
-print(f"\n  📊 Self-Test Results:")
-print(f"     Normal:    {n_normal}")
-print(f"     Anomalies: {n_anomalies}")
-print(f"     Anomaly %: {n_anomalies / len(predictions) * 100:.1f}%")
+    models_dir = os.path.join(SCRIPT_DIR, "models")
+    os.makedirs(models_dir, exist_ok=True)
+    model_path = os.path.join(models_dir, "forensic_alarm_v2.pkl")
+    joblib.dump(model, model_path)
+    print(f"\nSaved {model_path}")
+    print(f"Features: {', '.join(FEATURE_COLUMNS)}")
+    return 0
 
 
-# ─────────────────────────────────────────────────────────────────────
-# 5. SAVE MODEL
-# ─────────────────────────────────────────────────────────────────────
-models_dir = os.path.join(SCRIPT_DIR, "models")
-os.makedirs(models_dir, exist_ok=True)
-model_path = os.path.join(models_dir, "forensic_alarm_v2.pkl")
-joblib.dump(model, model_path)
-
-print(f"\n{'═' * 50}")
-print(f"  ✅ SUCCESS: forensic_alarm_v2.pkl saved")
-print(f"  📁 Path: {model_path}")
-print(f"  🔢 Features: EventID, HourOfDay, EventsPerMinute")
-print(f"{'═' * 50}")
+if __name__ == "__main__":
+    sys.exit(main())

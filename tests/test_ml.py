@@ -1,6 +1,7 @@
 import pandas as pd
 
-from forensics.ml import engineer_features, get_anomaly_status
+from forensics.ml import (FEATURE_COLUMNS, compute_features,
+                          engineer_features, get_anomaly_status)
 
 
 def test_engineered_features_present(artifact_df):
@@ -55,3 +56,64 @@ def test_events_per_minute_counts_burst():
 
 def test_get_anomaly_status_defaults():
     assert get_anomaly_status({}) == (1, "VERIFIED NORMAL")
+
+
+def _burst(n, second_stride=0):
+    """n events inside one minute, optionally spread by `second_stride`."""
+    return pd.DataFrame([{
+        'Date and Time': (f'2024-03-01 04:00:{(i * second_stride) % 60:02d}'
+                          if second_stride else '2024-03-01 04:00:00'),
+        'Event ID': '4625', 'Task Category': 'failed logon',
+        'LogSource': 'SECURITY', 'Keywords': 'None', 'ArtifactType': 'EVTX',
+    } for i in range(n)])
+
+
+def test_events_per_minute_is_not_capped_by_the_lookback():
+    """The old implementation scanned back at most 100 rows, so its answer
+    saturated at 101. On the real image that silently flattened 58,058 rows
+    (72%) whose true rates ran from 101 to 14,474 — a feature constant across
+    three quarters of the data, which is most of why the model flagged 37%."""
+    out = compute_features(_burst(500))
+    assert out['EventsPerMinute'].max() == 500, (
+        f"capped at {out['EventsPerMinute'].max()}")
+
+
+def test_events_per_minute_is_a_rolling_window_not_a_running_total():
+    """Events older than 60s must drop out, or it becomes a row counter."""
+    rows = pd.concat([
+        _burst(10),                                    # 04:00:00
+        pd.DataFrame([{
+            'Date and Time': '2024-03-01 06:00:00', 'Event ID': '4625',
+            'Task Category': 'failed logon', 'LogSource': 'SECURITY',
+            'Keywords': 'None', 'ArtifactType': 'EVTX',
+        }]),
+    ], ignore_index=True)
+    out = compute_features(rows)
+    assert out['EventsPerMinute'].iloc[-1] == 1, (
+        "counted events from two hours earlier")
+
+
+def test_unparseable_timestamp_does_not_become_noon():
+    """A missing hour used to default to 12, inventing a midday spike out of
+    absent data and putting it in the middle of the feature's range."""
+    df = pd.DataFrame([{
+        'Date and Time': 'not a date', 'Event ID': '4624',
+        'Task Category': 'logon', 'LogSource': 'SECURITY',
+        'Keywords': 'None', 'ArtifactType': 'EVTX',
+    }])
+    assert compute_features(df)['HourOfDay'].iloc[0] == -1
+
+
+def test_training_and_inference_share_one_feature_definition():
+    """isolation_model.py imports this rather than reimplementing it. The last
+    train/serve skew was a 50-row lookback at inference against 100 in
+    training, and neither file looked wrong on its own."""
+    import importlib
+
+    mod = importlib.import_module("forensics.ml")
+    assert mod.compute_features is compute_features
+    assert FEATURE_COLUMNS == ["EventID_Num", "HourOfDay", "EventsPerMinute"]
+
+    out = compute_features(_burst(5, second_stride=1))
+    for col in FEATURE_COLUMNS:
+        assert col in out.columns

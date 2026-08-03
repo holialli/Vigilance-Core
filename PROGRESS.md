@@ -34,8 +34,10 @@ it. That had been the outstanding blocker for three sessions.
    of headroom. Every workaround in `embedding.py` exists to fit inside that.
    **Not done here deliberately** — it needs admin, affects the whole machine,
    and is the owner's call.
-2. **Retrain or retire the anomaly model** (item 5 below). Still fires on 30% of
-   artifacts; the biggest *quality* gap left, now that the index builds.
+2. **Retrain the anomaly model once a second real carve is cached** (item 5
+   below). It is down from 37.1% to 2.1% flagged, but it has only ever seen one
+   image; `isolation_model.py` concatenates every carve under `src/cache/`, so
+   this is just "carve another image, re-run the script".
 3. **Sweep `FORENSICS_EMBED_BATCH` upward** once a page file exists. 32 was
    chosen to fit today's headroom; 64 was 1.2x faster in the sweep and 256 only
    lost because it thrashed. This is pure throughput, worth little until (1).
@@ -760,12 +762,72 @@ about getting faiss/torch/sklearn onto one OpenMP runtime — it is
 **enable a page file**. Until then the code is fitting into a commit limit that
 happens to equal RAM.
 
-### 5. The ML model is close to useless as-is
-`AnomalyScore == -1` fires on **30.1%** of artifacts (23,068 / 76,693) on the
-real image. Trained on synthetic CSVs that look nothing like real registry data.
-`anomaly_overview()` reports the flag rate and warns, but the real fix is
-retraining on features from actual carved images — or dropping the statistical
-model and keeping only the heuristic Event-ID rules, which *do* work.
+### 5. The ML model was close to useless — FIXED. 37.1% → 2.1%.
+
+`AnomalyScore == -1` fired on **37.1%** of the promoted carve (29,787 / 80,191),
+and **29,649 of those were "STATISTICAL ANOMALY (Behavioral)"** against only 138
+heuristic hits. It was labelling 945 copies of an ordinary
+`ControlSet002\Control` registry key as a behavioural anomaly.
+
+**Two independent causes, both found by looking at the features rather than the
+flag rate.**
+
+**(a) `EventsPerMinute` was capped by its own loop bound.** It counted events in
+the previous 60 seconds by scanning back *at most 100 rows*, so it could never
+return more than 101. Measured on the 80,191-row carve:
+
+| | old (100-row lookback) | new (`searchsorted`) |
+|---|---:|---:|
+| time | 11.00s | **0.01s** (924x) |
+| max value | 101 | 14,474 |
+| distinct values | 101 | 14,474 |
+| rows at the cap | **58,058 (72%)** | — |
+
+The two agree on 28% of rows. Those 58,058 saturated rows had true rates from
+101 to 14,474 and every one was reported as 101. **A feature that is constant
+across three quarters of the data cannot separate anything**, and the flagged
+and unflagged populations proved it — identical min/median/max on both
+`EventsPerMinute` *and* `EventID_Num`. The model was left splitting on
+`HourOfDay` and on EventID *magnitude*: 87% of rows with EventID < 999 flagged,
+97% above 10,000, 33% in between. That is thresholding an identifier.
+
+**(b) Train/serve distribution skew.** It was trained on the synthetic CSVs in
+`src/data/`, which look nothing like a real registry hive — so at inference
+essentially everything looked anomalous. `contamination=0.02` sets the flag rate
+*on data resembling the training set*, which real artifacts did not.
+
+**Fixed:**
+- `forensics.ml.compute_features` is now the single definition of the feature
+  set, and `isolation_model.py` **imports** it. Two hand-maintained copies is how
+  the previous skew got in (50-row lookback at inference vs 100 in training).
+- `isolation_model.py` trains on **real carved artifacts** (`src/cache/*/artifacts.pkl`),
+  falling back to the CSVs only with a loud warning.
+- **Synthetic threat injection removed.** It added 50 tight copies each of seven
+  "threat" patterns, intending to teach the model to catch them. An Isolation
+  Forest calls *sparse* regions anomalous, so dense clusters of a pattern teach
+  it the pattern is **normal** — precisely backwards. Those IDs are already
+  covered deterministically by `HEURISTIC_THREAT_IDS`.
+- Unparseable timestamps give `HourOfDay = -1` instead of `12`, which had been
+  inventing a midday spike out of missing data, in the middle of the range.
+
+**Result on the same image** (`engineer_features` also went 11s → 5.2s):
+
+| | before | after |
+|---|---:|---:|
+| flagged | 29,787 (37.1%) | **1,723 (2.1%)** |
+| statistical | 29,649 (37.0%) | 1,585 (1.98%) |
+| REGISTRY flagged | 28.9% | **0.3%** |
+| EVTX flagged | 74.3% | 7.7% |
+
+The features now separate: flagged rows sit at median hour 12 vs 4, median rate
+277 vs 988 (quiet periods), and reach EventID 51,047 vs 15,007. `anomaly_overview()`
+reports `noisy: False` for the first time.
+
+**Still imperfect, deliberately left:** RECYCLE (29/29) and RECENT (8/8) come
+back 100% flagged. They are genuinely rare row types, it is 37 rows out of
+80,191, and tuning a model to un-flag a whole artifact type is how you end up
+overfitting to one image. Retrain once a second real carve is cached — the
+script already concatenates every carve it finds.
 
 ### 6. Not a bug: missing NTUSER hives
 `BillyBob`, `Fred Flintstone`, `James Russell` and `Joe Nameless` report
