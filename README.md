@@ -22,6 +22,66 @@ Core capabilities:
 **Answers are grounded, not generated from memory.** The model is given retrieved artifacts and
 required to cite them. If retrieval finds nothing relevant, it says so rather than filling the gap.
 
+## How it works
+
+```
+ .dd/.raw/.E01 ──▶ carve ──▶ score ──▶ index ──▶ retrieve ──▶ answer with citations
+                    │          │         │           │
+              ~16 extractors  Isolation  FAISS   semantic + lexical
+              over pytsk3/    Forest +   over    + query→type routing
+              pyewf           rules      MiniLM
+```
+
+The design decisions that aren't obvious, and why they are the way they are:
+
+**Carving runs serially, not in a thread pool.** The obvious optimisation is one thread per artifact
+type. It was measured: threading was *slower*, and worse, it silently dropped evidence. A pytsk3
+directory listing is invalidated by any other access through the same handle, so a concurrent
+extractor could truncate another's listing with nothing raised — entries simply never appeared. That
+cost the two largest event logs and every user profile after the first. `CARVE_MAX_WORKERS=1`.
+
+**Retrieval is hybrid, and the split is deliberate.** Only high-volume types (`EVTX`, `REGISTRY`,
+`SAM`, `SOFTWARE`) get embedded. Low-volume high-value types — USB, browser, prefetch, recycle bin —
+are scanned lexically on every query instead. That isn't a shortcut: it means adding a new artifact
+type never invalidates a built index, and a USB device with one occurrence can't be buried by
+semantic similarity against 60,000 registry keys.
+
+**The embedding step runs in a child process.** A native crash there would take the whole Gradio
+server down, and `except Exception` cannot catch a segfault. Encoding writes fingerprinted chunks to
+disk, so a build that dies resumes instead of restarting.
+
+**Known-bad Event IDs are rules, not machine learning.** An Isolation Forest flags *sparse* regions,
+so training it on clusters of known-bad patterns teaches it those patterns are normal — the exact
+opposite of the intent. IDs like 1102 (audit log cleared) are handled deterministically in
+`HEURISTIC_THREAT_IDS`; the model is left to do the thing it's actually suited for.
+
+**Case state lives per browser session, not in module globals**, so two investigators working
+concurrently can't overwrite each other's case.
+
+Architecture and module layout: [CLAUDE.md](CLAUDE.md).
+
+## Engineering log
+
+[PROGRESS.md](PROGRESS.md) is the running log — what broke, how it was diagnosed, and which earlier
+conclusions turned out to be wrong. A few that were expensive:
+
+- **The anomaly model flagged 37% of a real image.** The cause wasn't the threshold. One feature was
+  capped by its own loop bound — it counted events in a 60-second window by scanning back at most
+  100 rows, so it could never return more than 101, and **58,058 rows (72%) sat at that ceiling**
+  with true rates up to 14,474. Flagged and unflagged artifacts had identical distributions on it.
+  Fixing the feature and retraining on real carved data took it to 2.1%.
+
+- **The index would have cited the wrong evidence, silently.** Retrieval binds FAISS vector *i* to
+  row *i* positionally, but the cache was validated by row *count*. Re-scoring re-sorted the frame
+  with a non-stable sort, and **51,195 of 60,414 positions moved while the check still passed** —
+  every citation resolving to a different artifact while still looking properly sourced. Fixed with
+  a stable sort plus an order-sensitive fingerprint, and verified by making each row find its own
+  vector.
+
+- **Three sessions were lost to a misdiagnosis.** Repeated `0xC0000005` crashes were attributed to
+  mixed OpenMP runtimes. They were out-of-memory: with no Windows page file the commit limit equals
+  physical RAM, and the machine showed 3.7 GB of free RAM alongside 369 MB of free *commit*.
+
 ## Installation
 
 1. Clone the repository.
