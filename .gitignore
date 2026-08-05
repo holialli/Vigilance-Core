@@ -33,8 +33,9 @@ Thumbs.db
 src/metadata.pkl
 src/models/forensic_vdb.index
 
-# CI workflow: needs a PAT with `workflow` scope to push; add via GitHub UI
-.github/
+# NOTE: .github/ is deliberately NOT ignored — CI lives there. Pushing a
+# workflow file needs a PAT with `workflow` scope; if the push is rejected,
+# add the file through the GitHub web UI instead of re-ignoring it.
 
 # Misc notes/scratch text
 notes.txt
@@ -45,3 +46,6 @@ run_audit.py
 Forensic_ROADMAP.md
 run_audit.py
 build_vector_index.py
+# Internal working notes — kept locally, not published
+PROGRESS.md
+CLAUDE.md

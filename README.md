@@ -1,234 +1,309 @@
-# AI Forensic Engine
+# Vigilance Core
 
 A digital forensics analysis tool that ingests raw disk images, carves artifacts from them, and
 answers natural-language investigator questions grounded in the recovered evidence.
 
-## Tool Overview
+Upload a `.dd`, `.raw` or `.E01` image and Vigilance Core carves it into a single artifact table,
+screens that table for anomalies, indexes it for retrieval, and lets you query it in plain English —
+with every claim cited back to the artifact it came from.
 
-Upload a `.dd`, `.raw` or `.E01` image and the engine carves it into a single artifact table, screens
-that table for anomalies, indexes it for retrieval, and lets you ask questions about it in plain
-English — with every claim cited back to the artifact it came from.
+---
 
-Core capabilities:
+## Features
 
-- Automated extraction of EVTX logs, registry hives, filesystem metadata, browser and user activity,
-  USB history, prefetch, SRUM, shimcache and recycle bin records
-- SHA-256 hashing of the source image for integrity tracking, with per-image caching
-- Isolation Forest anomaly screening, plus deterministic rules for known-bad Event IDs
-- FAISS-backed hybrid retrieval (semantic + lexical + query routing) for grounded question answering
-- Inline `[E1]`-style citations resolved into an evidence appendix, so answers can be checked
-- PDF report generation with case metadata and evidence summaries
+- **Artifact carving** — EVTX event logs, registry hives (SYSTEM, SOFTWARE, SAM, NTUSER), filesystem
+  metadata, browser and user activity, USB device history, prefetch, SRUM, shimcache, recycle bin
+  records and deleted-file entries
+- **Integrity tracking** — SHA-256 hashing of the source image, with all results cached per image hash
+- **Anomaly screening** — Isolation Forest behavioural scoring, combined with deterministic rules for
+  known-bad Event IDs (audit log cleared, account creation, brute-force logons, registry persistence)
+- **Grounded question answering** — FAISS-backed hybrid retrieval feeding an LLM that is required to
+  cite its sources inline; citations resolve to a full evidence appendix
+- **Investigation tools** — searchable artifact table, timeline view, triage findings, entity
+  correlation and pivoting
+- **Reporting** — PDF case reports with metadata and evidence summaries
+- **Local-first LLM support** — runs fully offline against Ollama, so evidence never leaves the machine
 
-**Answers are grounded, not generated from memory.** The model is given retrieved artifacts and
-required to cite them. If retrieval finds nothing relevant, it says so rather than filling the gap.
+Answers are grounded rather than generated from memory. The model is given retrieved artifacts and
+required to cite them; if retrieval finds nothing relevant, it reports that instead of filling the gap.
+
+---
 
 ## How it works
 
 ```
  .dd/.raw/.E01 ──▶ carve ──▶ score ──▶ index ──▶ retrieve ──▶ answer with citations
-                    │          │         │           │
-              ~16 extractors  Isolation  FAISS   semantic + lexical
-              over pytsk3/    Forest +   over    + query→type routing
-              pyewf           rules      MiniLM
+                     │         │         │           │
+              ~16 extractors  Isolation FAISS    semantic + lexical
+              via pytsk3 /    Forest +  over     + query→type routing
+              pyewf           rules     MiniLM
 ```
 
-The design decisions that aren't obvious, and why they are the way they are:
+1. **Carve** — the image is opened with `pytsk3` (raw) or `pyewf` (`.E01`, all segments). Partition
+   offsets are probed, a shared path index is built, and roughly sixteen extractors run against it.
+   Each returns a DataFrame; the results are concatenated into one artifact table.
+2. **Score** — three behavioural features (Event ID, hour of day, events per minute) are computed and
+   scored by a trained Isolation Forest. Known-bad Event IDs are flagged separately by rule, so they
+   are always surfaced regardless of the model.
+3. **Index** — high-volume artifact types (`EVTX`, `REGISTRY`, `SAM`, `SOFTWARE`) are embedded with
+   `all-MiniLM-L6-v2` into a FAISS index. Low-volume, high-value types (USB, browser, prefetch,
+   recycle bin) are scanned lexically at query time instead, so they cannot be buried by semantic
+   similarity against tens of thousands of registry keys.
+4. **Retrieve** — queries are answered by combining semantic search, lexical matching and
+   query→artifact-type routing.
+5. **Answer** — the retrieved evidence is passed to an LLM under a grounded system prompt requiring
+   inline `[E1]`-style citations, which the interface resolves into an evidence appendix.
 
-**Carving runs serially, not in a thread pool.** The obvious optimisation is one thread per artifact
-type. It was measured: threading was *slower*, and worse, it silently dropped evidence. A pytsk3
-directory listing is invalidated by any other access through the same handle, so a concurrent
-extractor could truncate another's listing with nothing raised — entries simply never appeared. That
-cost the two largest event logs and every user profile after the first. `CARVE_MAX_WORKERS=1`.
+### Project layout
 
-**Retrieval is hybrid, and the split is deliberate.** Only high-volume types (`EVTX`, `REGISTRY`,
-`SAM`, `SOFTWARE`) get embedded. Low-volume high-value types — USB, browser, prefetch, recycle bin —
-are scanned lexically on every query instead. That isn't a shortcut: it means adding a new artifact
-type never invalidates a built index, and a USB device with one occurrence can't be buried by
-semantic similarity against 60,000 registry keys.
+```
+src/chatbot_app.py      Gradio interface and entry point
+src/isolation_model.py  anomaly model training script
+src/forensics/
+  config.py       paths, threat-ID rules, hashset locations
+  session.py      per-case session state
+  parsers.py      EVTX, registry hive, hashing, E01 adapter
+  extractors.py   artifact extractors and carve orchestration
+  ml.py           feature engineering and anomaly scoring
+  rag.py          retrieval, citations, FAISS index construction
+  embedding.py    sentence embedding (isolated in a subprocess)
+  context.py      system-context extraction
+  llm.py          provider chain and prompting
+  reporting.py    PDF report generation
+  analysis.py     search, timeline, triage, anomaly overview
+  correlation.py  entity extraction and pivoting
+  cases.py        case save / load / list
+  shimcache.py    AppCompatCache parsing
+  hashsets.py     known-good / known-bad hash matching
+  recyclebin.py   INFO2 and $I record parsing
+```
 
-**The embedding step runs in a child process.** A native crash there would take the whole Gradio
-server down, and `except Exception` cannot catch a segfault. Encoding writes fingerprinted chunks to
-disk, so a build that dies resumes instead of restarting.
+---
 
-**Known-bad Event IDs are rules, not machine learning.** An Isolation Forest flags *sparse* regions,
-so training it on clusters of known-bad patterns teaches it those patterns are normal — the exact
-opposite of the intent. IDs like 1102 (audit log cleared) are handled deterministically in
-`HEURISTIC_THREAT_IDS`; the model is left to do the thing it's actually suited for.
+## Requirements
 
-**Case state lives per browser session, not in module globals**, so two investigators working
-concurrently can't overwrite each other's case.
+| | |
+|---|---|
+| **OS** | Windows 10/11 (recommended), Linux, or WSL. macOS is partial. |
+| **Python** | **3.11 or newer.** The pinned `pandas`, `numpy` and `scikit-learn` all declare `requires-python >= 3.11`, so installation on 3.10 fails to resolve. |
+| **RAM** | 16 GB recommended. |
+| **Disk** | ~2 GB for dependencies and models, plus space for cached carve results. |
+| **Virtual memory** | On Windows, **a page file must be enabled.** See below. |
+| **Network** | Required on first run to download the embedding model (~90 MB). |
 
-Architecture and module layout: [CLAUDE.md](CLAUDE.md).
+### Windows: the page file must be enabled
 
-## Engineering log
+With no page file, Windows' *commit limit* equals physical RAM exactly, and allocations are refused
+once that limit is reached — **even while gigabytes of RAM appear free**, because other processes have
+already reserved against it. The embedding model needs approximately 1,040 MB of commit to load, and
+index construction will fail without it, typically as:
 
-[PROGRESS.md](PROGRESS.md) is the running log — what broke, how it was diagnosed, and which earlier
-conclusions turned out to be wrong. A few that were expensive:
+```
+OSError: The paging file is too small for this operation to complete. (os error 1455)
+```
 
-- **The anomaly model flagged 37% of a real image.** The cause wasn't the threshold. One feature was
-  capped by its own loop bound — it counted events in a 60-second window by scanning back at most
-  100 rows, so it could never return more than 101, and **58,058 rows (72%) sat at that ceiling**
-  with true rates up to 14,474. Flagged and unflagged artifacts had identical distributions on it.
-  Fixing the feature and retraining on real carved data took it to 2.1%.
+or as a bare `0xC0000005` with no traceback.
 
-- **The index would have cited the wrong evidence, silently.** Retrieval binds FAISS vector *i* to
-  row *i* positionally, but the cache was validated by row *count*. Re-scoring re-sorted the frame
-  with a non-stable sort, and **51,195 of 60,414 positions moved while the check still passed** —
-  every citation resolving to a different artifact while still looking properly sourced. Fixed with
-  a stable sort plus an order-sensitive fingerprint, and verified by making each row find its own
-  vector.
+To enable: `sysdm.cpl` → **Advanced** → **Performance → Settings** → **Advanced** → **Virtual memory
+→ Change** → either tick *Automatically manage paging file size for all drives*, or set a custom size
+on C: (4096 MB initial / 8192 MB maximum is ample). Adding a page file takes effect immediately; only
+removing one requires a restart.
 
-- **Three sessions were lost to a misdiagnosis.** Repeated `0xC0000005` crashes were attributed to
-  mixed OpenMP runtimes. They were out-of-memory: with no Windows page file the commit limit equals
-  physical RAM, and the machine showed 3.7 GB of free RAM alongside 369 MB of free *commit*.
+### Native dependencies
+
+Two dependencies are native extensions and must be able to build:
+
+| Package | Purpose | Install notes |
+|---|---|---|
+| `pytsk3` | SleuthKit filesystem parsing | Windows: requires Visual C++ Build Tools. Debian/Ubuntu: `sudo apt install libtsk-dev`. macOS: `brew install sleuthkit`. |
+| `libewf-python` | `.E01` (EWF) image support | Requires `libewf` present on Linux and macOS. |
+
+Vigilance Core starts and runs without them — every feature except image carving remains available —
+but they are required to open disk images.
+
+---
 
 ## Installation
 
-1. Clone the repository.
-2. Create and activate a Python virtual environment (**Python 3.11+**; developed on 3.12).
-3. Install dependencies:
-   ```bash
-   pip install -r requirements.txt
-   ```
-4. Configure at least one LLM provider:
-   ```bash
-   cp .env.example src/.env      # then edit src/.env
-   ```
+```bash
+git clone https://github.com/holialli/Vigilance-Core.git
+cd Vigilance-Core
 
-### Choosing an LLM provider
+python -m venv .venv
+.venv\Scripts\activate        # Windows
+source .venv/bin/activate     # Linux / macOS
 
-The app tries providers in a fixed order and falls through on failure or absence:
+pip install -r requirements.txt
+```
+
+Then configure at least one LLM provider:
+
+```bash
+cp .env.example src/.env       # then edit src/.env
+```
+
+---
+
+## Configuration
+
+Vigilance Core tries LLM providers in a fixed order and falls through on failure or absence:
 
 **Ollama (local) → Groq (cloud) → Gemini (cloud) → deterministic offline summary**
 
-Any subset may be configured; the app only refuses to start if *none* is available. If every
-configured provider fails at query time, it still answers — from system facts and the retrieved
-evidence directly, with no LLM involved.
+Any subset may be configured. The application refuses to start only if none is available. If every
+configured provider fails at query time, it still answers — from system facts and retrieved evidence
+directly, without an LLM.
 
-**Prefer Ollama where the evidence is real.** It runs entirely on your machine, so artifact text is
-never sent to a third-party API — which on an actual case may be a requirement rather than a
-preference. It needs no key and no account:
+| Variable | Purpose | Default |
+|---|---|---|
+| `OLLAMA_BASE_URL` | Local Ollama endpoint | `http://localhost:11434` |
+| `OLLAMA_MODEL` | Local model name | `llama3.2` |
+| `GROQ_API_KEY` | Groq API key | — |
+| `GEMINI_API_KEY` | Google Gemini API key | — |
+| `FORENSICS_EMBED_BATCH` | Encode batch size; sets peak memory | `32` |
+| `FORENSICS_EMBED_CHUNK` | Encode chunk size; resume granularity | `500` |
+| `CARVE_MAX_WORKERS` | Extractor concurrency | `1` |
+
+### Using Ollama (recommended)
+
+Ollama runs entirely on the local machine, so artifact text is never transmitted to a third-party
+API — which may be a requirement rather than a preference when handling real evidence. It needs no
+API key and no account:
 
 ```bash
 ollama serve
 ollama pull llama3.2
 ```
 
-Groq and Gemini both have free tiers and need only an API key. See `.env.example`.
+Groq and Gemini both offer free tiers and require only an API key. See `.env.example`.
 
-## Dependencies and Prerequisites
+---
 
-- **OS**: Windows 10/11 or Linux (WSL works). macOS is partial — see Platform Compatibility.
-- **Python**: **3.11 or newer.** The pinned `pandas`, `numpy` and `scikit-learn` in
-  `requirements.txt` all declare `requires-python >= 3.11`, so installing on 3.10 fails to resolve.
-- **RAM**: 16 GB recommended.
-- **Virtual memory**: on Windows, **a page file must be enabled** — see below. This matters more
-  than the RAM figure.
-
-> ### Windows: enable the page file
->
-> With no page file, Windows' *commit limit* equals physical RAM exactly, and a program is refused
-> memory once the limit is reached — **even when gigabytes of RAM are physically free**, because
-> other processes have already reserved against it. On a 16 GB machine with the page file disabled
-> this project measured 3.7 GB of free RAM alongside only 369 MB of free commit, and the embedding
-> model needs ~1,040 MB to load. The index build fails, usually as an
-> `OSError: The paging file is too small for this operation to complete. (os error 1455)`, or as a
-> bare `0xC0000005` with no traceback.
->
-> To enable: `sysdm.cpl` → Advanced → Performance Settings → Advanced → Virtual memory → Change →
-> either tick "Automatically manage", or set a custom size on C: (4096 MB initial / 8192 MB maximum
-> is ample). Adding a page file takes effect immediately; only removing one needs a reboot.
-
-Primary Python dependencies:
-
-- `gradio`, `pandas`, `numpy`, `scikit-learn`
-- `sentence-transformers`, `faiss-cpu`, `torch`
-- `python-evtx`, `python-registry`, `pytsk3` (SleuthKit), `libewf-python` (`.E01` support)
-- `reportlab` for PDF report generation
-
-`pytsk3` and `libewf-python` are native and may need OS-level libraries present first.
-
-## Execution Steps
+## Usage
 
 ```bash
 python src/chatbot_app.py
 ```
 
-1. Open the local Gradio URL shown in the terminal (default `http://localhost:7860`).
-2. Upload one or more forensic image files (`.dd`, `.raw`, `.E01` — all segments of an EWF set).
-3. Wait for carving and index preparation to finish. The first run on a given image is the slow one;
-   results are cached by image hash, so re-uploading the same image skips extraction entirely.
-4. Use the tabs:
-   - **AI Investigation** — natural-language questions with cited evidence
-   - **Dashboard & Summary** — case-level overview and anomaly counts
-   - **Raw Artifacts** — tabular inspection, search, timeline and triage
+Open the local URL shown in the terminal — by default `http://localhost:7860`.
+
+1. Upload one or more forensic image files (`.dd`, `.raw`, `.E01`). For a split EWF set, all segments
+   must be present; the first segment is sufficient to select, and siblings are discovered
+   automatically.
+2. Wait for carving and index construction to complete. This is the slow step, and it happens once
+   per image.
+3. Work through the interface tabs:
+
+| Tab | Purpose |
+|---|---|
+| **AI Investigation** | Natural-language questions answered with cited evidence |
+| **Dashboard & Summary** | Case overview, artifact counts, anomaly totals, activity timeline |
+| **Raw Artifacts** | Tabular inspection, search, timeline, triage findings and correlation |
+
+### Caching
+
+Results are cached per image hash under `src/cache/<sha256>/`:
+
+| File | Contents |
+|---|---|
+| `artifacts.pkl` | Carved artifact table — re-uploading the same image skips extraction entirely |
+| `faiss.index` | Vector index, with a fingerprint sidecar validating that it matches the current artifact set |
+| `embed_chunks/` | Partial encode output, so an interrupted index build resumes rather than restarting |
+| `case.json` | Case metadata: name, examiner, notes, artifact counts |
+
+> **Note:** cached data contains the full carved contents of the analysed image. Treat
+> `src/cache/` with the same handling requirements as the evidence itself.
+
+---
 
 ## Training the anomaly model
 
-A trained model ships in `src/models/forensic_alarm_v2.pkl`, so this is optional. To retrain:
+A trained model ships in `src/models/forensic_alarm_v2.pkl`, so this step is optional.
 
 ```bash
 cd src && python isolation_model.py
 ```
 
-It trains on **real carved artifacts** — every `src/cache/*/artifacts.pkl` on the machine — and falls
-back to the synthetic CSVs in `src/data/` with a warning if none exists.
+Training uses real carved artifacts — every `src/cache/*/artifacts.pkl` present on the machine — and
+falls back to the synthetic CSVs in `src/data/` with a warning if no carve is available. The
+application only ever loads the resulting model; it never trains at runtime.
 
-> **The shipped model was trained on a single disk image.** It will be miscalibrated on evidence that
-> looks different, and re-running the script once you have carved your own images is worth doing —
-> it concatenates every carve it finds. For reference: the same model trained only on the synthetic
-> CSVs flagged **37% of a real image** as anomalous, because a real registry hive looks nothing like
-> a synthetic event log. Trained on real carves it flags about 2%.
->
-> The model stores decision thresholds over three numeric features (Event ID, hour of day, events per
-> minute). It contains no artifact text, so publishing it discloses nothing about the source image.
+The shipped model was trained on a single disk image and will be less well calibrated on evidence
+that differs substantially. Re-running the script after carving your own images is recommended; it
+concatenates every carve it finds. The model stores decision thresholds over three numeric features
+only and contains no artifact text.
 
-## Known limitations
+Synthetic training data can be regenerated with `src/scripts/generate_demo_logs.py` and
+`src/scripts/generate_registry_data.py`.
 
-- The anomaly model has only been trained on one image (above).
-- `RECYCLE` and `RECENT` artifacts currently come back fully flagged — 37 rows out of 80,191 on the
-  reference image. Left as-is deliberately rather than tuned away against a single case.
-- macOS support depends on native forensic parsing libraries that do not always install cleanly.
+---
 
 ## Testing
 
 ```bash
-python -m pytest tests/ -q      # 154 tests
+python -m pytest tests/ -q      # 156 tests
 ```
 
-## Platform Compatibility
+---
 
-- **Windows**: fully supported and recommended.
-- **Linux**: supported where the native forensic libraries are installed.
-- **macOS**: partial; depends on successful installation of the forensic parsing dependencies.
+## Platform compatibility
+
+| Platform | Status |
+|---|---|
+| **Windows 10/11** | Fully supported and recommended. Requires an enabled page file. |
+| **Linux / WSL** | Supported where `libtsk-dev` and `libewf` are installed. |
+| **macOS** | Partial — depends on successful installation of the native forensic parsers. |
+
+---
+
+## Limitations
+
+- **Not a validated forensic tool.** Vigilance Core is an analysis and triage aid. It has not been
+  validated against NIST CFTT or any equivalent programme and should not be relied upon as the sole
+  basis for findings presented in legal proceedings.
+- **Local use.** The interface has no authentication and binds to localhost. It is intended to run on
+  an examiner's own machine, not to be exposed on a network or shared host.
+- **Cloud LLM providers transmit evidence text.** Groq and Gemini receive the retrieved artifact
+  excerpts included in a query. Use Ollama where this is not acceptable.
+- **Anomaly model calibration** — see *Training the anomaly model* above. `RECYCLE` and `RECENT`
+  artifacts are currently over-flagged.
+- **Windows-oriented artifacts.** Extraction targets Windows filesystems and artifact types; Linux
+  and macOS images are not meaningfully supported.
+
+---
 
 ## Troubleshooting
 
-**The index build fails, or crashes with `0xC0000005` and no traceback.**
-This is an out-of-memory until proven otherwise — see the page file note above. Check *available
-commit*, not free RAM; on Windows they can differ by gigabytes. If a page file is already enabled,
-lower `FORENSICS_EMBED_BATCH` (default 32) and avoid running anything heavy alongside the build. A
-failed build keeps its finished work in `src/cache/<hash>/embed_chunks/` and resumes from there, so
-re-running is cheap.
+**Index construction fails, or crashes with `0xC0000005` and no traceback.**
+This is an out-of-memory condition. Confirm a page file is enabled (see *Requirements*), and check
+*available commit* rather than free RAM — on Windows the two can differ by several gigabytes. If a
+page file is already present, reduce `FORENSICS_EMBED_BATCH` and avoid running memory-intensive
+processes alongside the build. Interrupted builds retain completed work in `embed_chunks/` and resume
+on the next attempt.
 
-**Startup fails with missing packages.**
-`pip install -r requirements.txt --upgrade`
+**`ImportError` or build failure installing `pytsk3` / `libewf-python`.**
+Install the native prerequisites listed under *Native dependencies*, then reinstall. The application
+runs without them; only image carving is unavailable.
+
+**Installation fails to resolve dependencies.**
+Confirm Python 3.11 or newer: `python --version`.
 
 **`.E01` parsing fails.**
-Verify `libewf-python` installed correctly. All segments of the set (`.E01`, `.E02`, …) must be
-present and uploaded together.
+Verify `libewf-python` installed correctly, and that every segment of the set (`.E01`, `.E02`, …) is
+present in the same directory.
 
-**AI responses are unavailable.**
-Confirm at least one provider is configured in `src/.env`. If Ollama is your provider, check that
-`ollama serve` is running and the model has been pulled.
+**No AI responses.**
+Confirm at least one provider is configured in `src/.env`. If using Ollama, verify `ollama serve` is
+running and the model has been pulled.
 
-**Processing is slow on first run.**
-Expected — carving and index construction both happen once per image. Subsequent runs on the same
+**First run is slow.**
+Expected. Carving and index construction each occur once per image; subsequent runs against the same
 image hash reuse the cache.
 
-**No evidence appears after upload.**
-Check the terminal for extractor warnings and confirm the image is a valid, readable filesystem
-image.
+**No evidence after upload.**
+Check the terminal for extractor warnings and confirm the image is a valid, readable filesystem image.
+
+---
 
 ## License
 

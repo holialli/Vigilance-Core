@@ -1,5 +1,5 @@
 """
-Forensic Image Analysis Engine — Gradio application entry point.
+Vigilance Core — Gradio application entry point.
 
 Carving, ML triage, retrieval, and reporting live in the `forensics` package;
 this module wires them into the web UI.
@@ -188,7 +188,7 @@ def build_gui():
     """
 
     # ── Build the interface ───────────────────────────────────────────────────
-    with gr.Blocks(title="VIGILANCE Forensic Engine") as demo:
+    with gr.Blocks(title="Vigilance Core") as demo:
         session_state = gr.State(value=CaseSession)
 
         # ── Top banner ───────────────────────────────────────────────────────
