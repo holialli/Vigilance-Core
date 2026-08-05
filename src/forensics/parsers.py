@@ -160,8 +160,22 @@ def parse_registry_hive(reg_data, hive_name="SYSTEM"):
     return pd.DataFrame(records)
 
 
+PYTSK3_MISSING = (
+    "pytsk3 is not installed, so disk images cannot be opened.\n"
+    "It is a native extension and needs SleuthKit present before it will "
+    "build:\n"
+    "  Windows : pip install pytsk3   (needs Visual C++ Build Tools)\n"
+    "  Debian  : sudo apt install libtsk-dev && pip install pytsk3\n"
+    "  macOS   : brew install sleuthkit && pip install pytsk3\n"
+    "Everything except image carving works without it."
+)
+
 try:
     import pytsk3
+except ImportError:              # native build failed or SleuthKit is absent
+    pytsk3 = None
+
+if pytsk3 is not None:
     class EWFImgInfo(pytsk3.Img_Info):
         def __init__(self, ewf_handle):
             self._ewf_handle = ewf_handle
@@ -176,5 +190,22 @@ try:
 
         def get_size(self):
             return self._ewf_handle.get_media_size()
-except ImportError:
-    pass
+else:
+    class EWFImgInfo:
+        """Stand-in so this module still imports when pytsk3 is missing.
+
+        The class used to be defined *inside* a `try: import pytsk3` whose
+        `except ImportError` merely passed — which left the name undefined, and
+        `extractors.py` imports it at module level. Every user whose pytsk3
+        build failed therefore hit
+
+            ImportError: cannot import name 'EWFImgInfo' from 'forensics.parsers'
+
+        at startup: fatal, and silent about the actual cause. pytsk3 is a native
+        extension that fails to build often enough that this was the most likely
+        first-run failure there is. Now the import succeeds and the complaint
+        arrives when someone actually opens an image, saying what to install.
+        """
+
+        def __init__(self, *args, **kwargs):
+            raise RuntimeError(PYTSK3_MISSING)

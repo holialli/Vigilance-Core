@@ -25,7 +25,7 @@ required to cite them. If retrieval finds nothing relevant, it says so rather th
 ## Installation
 
 1. Clone the repository.
-2. Create and activate a Python virtual environment (Python 3.10+; developed on 3.12).
+2. Create and activate a Python virtual environment (**Python 3.11+**; developed on 3.12).
 3. Install dependencies:
    ```bash
    pip install -r requirements.txt
@@ -59,7 +59,8 @@ Groq and Gemini both have free tiers and need only an API key. See `.env.example
 ## Dependencies and Prerequisites
 
 - **OS**: Windows 10/11 or Linux (WSL works). macOS is partial — see Platform Compatibility.
-- **Python**: 3.10 or newer.
+- **Python**: **3.11 or newer.** The pinned `pandas`, `numpy` and `scikit-learn` in
+  `requirements.txt` all declare `requires-python >= 3.11`, so installing on 3.10 fails to resolve.
 - **RAM**: 16 GB recommended.
 - **Virtual memory**: on Windows, **a page file must be enabled** — see below. This matters more
   than the RAM figure.

@@ -1834,7 +1834,14 @@ def carve_evidence_from_image(image_source):
         "sam": 0, "software": 0, "prefetch": 0, "total": 0
     }
 
-    import pytsk3
+    try:
+        import pytsk3
+    except ImportError:
+        # Reached only if the install is incomplete. Say which package and how
+        # to get it, rather than surfacing a bare ModuleNotFoundError from six
+        # frames down in a background carve thread.
+        from .parsers import PYTSK3_MISSING
+        raise RuntimeError(PYTSK3_MISSING)
 
     filepaths = image_source if isinstance(image_source, list) else [image_source]
     primary_file = filepaths[0]

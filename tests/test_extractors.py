@@ -11,6 +11,8 @@ FakeFS below reproduces exactly that behaviour so the "collect names first,
 read second" ordering stays enforced without needing a real disk image.
 """
 
+import os
+
 import pandas as pd
 import pytest
 
@@ -333,3 +335,44 @@ def test_filesystem_walk_indexes_siblings_after_a_subdirectory():
     # pagefile.sys and boot.ini follow the Users directory in the listing —
     # they are precisely what the old recurse-while-iterating code lost.
     assert {"pagefile.sys", "boot.ini", "NTUSER.DAT", "alice", "Users"} <= names
+
+
+def test_package_imports_without_pytsk3():
+    """pytsk3 is a native extension that often fails to build, so plenty of
+    users will not have it. It must not break `import`.
+
+    EWFImgInfo used to be defined inside `try: import pytsk3` whose except
+    clause merely passed, leaving the name undefined — and extractors.py
+    imports it at module level. Those users got
+
+        ImportError: cannot import name 'EWFImgInfo' from 'forensics.parsers'
+
+    at startup: fatal, and silent about the real cause.
+    """
+    import importlib
+    import subprocess
+    import sys
+
+    # A subprocess, because forensics is already imported in this one and the
+    # absence has to be visible at import time to mean anything.
+    code = (
+        "import sys\n"
+        "sys.modules['pytsk3'] = None\n"
+        "sys.modules['pyewf'] = None\n"
+        "import forensics.extractors, forensics.parsers as p\n"
+        "assert hasattr(p, 'EWFImgInfo'), 'EWFImgInfo missing'\n"
+        "try:\n"
+        "    p.EWFImgInfo(None)\n"
+        "except RuntimeError as e:\n"
+        "    assert 'pytsk3' in str(e), str(e)\n"
+        "else:\n"
+        "    raise AssertionError('no error raised')\n"
+        "print('ok')\n"
+    )
+    src = os.path.join(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))), "src")
+    env = dict(os.environ, PYTHONPATH=src)
+    out = subprocess.run([sys.executable, "-c", code], capture_output=True,
+                         text=True, env=env, cwd=src)
+    assert out.returncode == 0, f"stdout={out.stdout}\nstderr={out.stderr}"
+    assert "ok" in out.stdout

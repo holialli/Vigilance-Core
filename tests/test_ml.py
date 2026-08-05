@@ -58,6 +58,24 @@ def test_get_anomaly_status_defaults():
     assert get_anomaly_status({}) == (1, "VERIFIED NORMAL")
 
 
+def test_shipped_model_loads_and_predicts():
+    """The pickle in src/models/ is what users get; nothing else here proves it
+    is loadable.
+
+    `engineer_features` wraps prediction in `except Exception` and falls back to
+    "everything normal", which is right for a live case — one broken model
+    should not lose the carve — but it means every other test in this file
+    passes just as happily against a model that cannot be unpickled at all. A
+    scikit-learn version bump would ship a dead model and go green.
+    """
+    from forensics.ml import get_model
+
+    model = get_model()
+    preds = model.predict([[4624, 9, 3], [1102, 3, 40]])
+    assert set(preds) <= {-1, 1}, preds
+    assert len(preds) == 2
+
+
 def _burst(n, second_stride=0):
     """n events inside one minute, optionally spread by `second_stride`."""
     return pd.DataFrame([{
